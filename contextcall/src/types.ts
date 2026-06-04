@@ -1,0 +1,170 @@
+export type MicCaptureMode = "auto" | "push-to-talk";
+
+export interface Utterance {
+  id: string;
+  text: string;
+  speaker: "you" | "them";
+  participantId?: string | null;
+  participantLabel?: string | null;
+  timestamp: string;
+}
+
+export interface Suggestion {
+  id: string;
+  kind: "knowledge_base" | "smart_question";
+  text: string;
+  timestamp: string;
+  kbHits: KBResult[];
+}
+
+export interface KBResult {
+  id: string;
+  text: string;
+  sourceFile: string;
+  headerContext: string;
+  score: number;
+}
+
+export interface AppSettings {
+  selectedModel: string;
+  transcriptionLocale: string;
+  transcriptionModel: string;
+  whisperModel: string;
+  sttProvider: string;
+  fasterWhisperModel: string;
+  fasterWhisperComputeType: string;
+  fasterWhisperDevice: string;
+  parakeetModel: string;
+  parakeetDevice: string;
+  omniAsrModel: string;
+  omniAsrDevice: string;
+  cohereTranscribeModel: string;
+  cohereTranscribeDevice: string;
+  diarizationEnabled: boolean;
+  echoCancellationEnabled: boolean;
+  micCalibrationRms: number | null;
+  micThresholdMultiplier: number;
+  micCaptureMode: MicCaptureMode;
+  pushToTalkHotkey: string;
+  inputDeviceName: string | null;
+  systemAudioDeviceName: string | null;
+  llmProvider: string;
+  embeddingProvider: string;
+  ollamaBaseUrl: string;
+  ollamaLlmModel: string;
+  ollamaEmbedModel: string;
+  openAiLlmBaseUrl: string;
+  openAiEmbedBaseUrl: string;
+  openAiEmbedModel: string;
+  codexCliPath: string;
+  codexCliModel: string;
+  codexCliFallbackProvider: string;
+  llamaServerPort: number;
+  suggestionIntervalSeconds: number;
+  suggestionsEnabled: boolean;
+  kbFolderPath: string | null;
+  notesFolderPath: string;
+  obsidianVaultPath: string | null;
+  obsidianKbIncludePaths: string[];
+  obsidianNotesFolder: string;
+  obsidianTranscriptsFolder: string;
+  defaultNotesTemplateId: string | null;
+  hasAcknowledgedRecordingConsent: boolean;
+  hideFromScreenShare: boolean;
+  hasCompletedOnboarding: boolean;
+  kbSurfacingSystemPrompt: string;
+  suggestionSynthesisSystemPrompt: string;
+  smartQuestionSystemPrompt: string;
+}
+
+export interface ApiKeys {
+  openRouterApiKey: string;
+  voyageApiKey: string;
+  openAiLlmApiKey: string;
+  openAiEmbedApiKey: string;
+  huggingFaceToken: string;
+}
+
+export interface CodexUsageSummary {
+  totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  fallbackRequests: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  unknownTokenRequests: number;
+  estimatedMeteredCostUsd: number | null;
+  billingNote: string;
+  ledgerPath: string;
+}
+
+export interface SttStatus {
+  selectedProvider: string;
+  effectiveProvider: string;
+  selectedModel: string;
+  effectiveModel: string;
+  selectedProviderReady: boolean;
+  ready: boolean;
+  usingFallback: boolean;
+  downloadRequired: boolean;
+  message: string;
+  parakeetWarming: boolean;
+  omniAsrWarming: boolean;
+  cohereTranscribeWarming: boolean;
+}
+
+export interface LlamaServerStatus {
+  binaryReady: boolean;
+  modelReady: boolean;
+  mmprojReady: boolean;
+  ready: boolean;
+  running: boolean;
+  port: number;
+  modelSource: string | null;
+  modelPath: string | null;
+  message: string;
+}
+
+export interface TranscriptionProgress {
+  capturedSegments: number;
+  processedSegments: number;
+}
+
+export interface SessionRecord {
+  id: string;
+  startedAt: string;
+  endedAt: string | null;
+  utteranceCount: number;
+  hasNotes: boolean;
+  title: string | null;
+}
+
+export interface MeetingTemplate {
+  id: string;
+  name: string;
+  icon: string;
+  system_prompt: string;
+  is_built_in: boolean;
+}
+
+export interface TemplateSnapshot {
+  id: string;
+  name: string;
+  icon: string;
+  systemPrompt?: string;
+  system_prompt?: string;
+}
+
+export interface EnhancedNotes {
+  template: TemplateSnapshot;
+  generatedAt?: string;
+  generated_at?: string;
+  markdown: string;
+}
+
+export interface SessionDetails {
+  transcript: Utterance[];
+  notes: EnhancedNotes | null;
+}

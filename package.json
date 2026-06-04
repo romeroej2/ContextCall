@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "workspaces": [
+    "contextcall"
+  ],
+  "scripts": {
+    "dev": "npm --prefix ./contextcall run dev",
+    "build": "npm --prefix ./contextcall run build",
+    "tauri": "npm --prefix ./contextcall run tauri --",
+    "lint": "npm --prefix ./contextcall run lint",
+    "lint:fix": "npm --prefix ./contextcall run lint:fix"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1"
+  }
+}

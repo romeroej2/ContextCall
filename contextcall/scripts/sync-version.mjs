@@ -1,0 +1,63 @@
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const workspaceRoot = path.resolve(__dirname, "../..");
+
+async function readWorkspaceVersion() {
+  const cargoTomlPath = path.join(workspaceRoot, "Cargo.toml");
+  const cargoToml = await readFile(cargoTomlPath, "utf8");
+  const match = cargoToml.match(
+    /\[workspace\.package\][\s\S]*?^version\s*=\s*"([^"]+)"/m,
+  );
+
+  if (!match) {
+    throw new Error("Could not find [workspace.package].version in Cargo.toml");
+  }
+
+  return match[1];
+}
+
+async function updateJsonFile(filePath, updater) {
+  const source = await readFile(filePath, "utf8");
+  const parsed = JSON.parse(source);
+  const updated = updater(parsed);
+  const next = `${JSON.stringify(updated, null, 2)}\n`;
+
+  if (next !== source) {
+    await writeFile(filePath, next, "utf8");
+  }
+}
+
+const version = await readWorkspaceVersion();
+
+await updateJsonFile(path.join(workspaceRoot, "contextcall", "package.json"), (json) => ({
+  ...json,
+  version,
+}));
+
+// The npm lockfile lives at the workspace root; the app is the "contextcall"
+// workspace member entry inside it.
+await updateJsonFile(path.join(workspaceRoot, "package-lock.json"), (json) => ({
+  ...json,
+  packages: json.packages
+    ? {
+        ...json.packages,
+        contextcall: json.packages.contextcall
+          ? {
+              ...json.packages.contextcall,
+              version,
+            }
+          : json.packages.contextcall,
+      }
+    : json.packages,
+}));
+
+await updateJsonFile(
+  path.join(workspaceRoot, "contextcall", "src-tauri", "tauri.conf.json"),
+  (json) => ({
+    ...json,
+    version,
+  }),
+);

@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/contextcall-core",
+    "contextcall/src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+
+[patch.crates-io]
+whisper-rs = { path = ".build/whisper-rs" }

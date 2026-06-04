@@ -1,0 +1,63 @@
+name: Build Mac App
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: contextcall
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            contextcall/src-tauri -> target
+
+      - name: Install macOS build dependencies
+        run: brew install cmake
+        working-directory: .
+
+      - name: Prepare whisper-rs
+        run: pwsh contextcall/scripts/prepare-whisper.ps1
+        working-directory: .
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build macOS DMG
+        # The -U__ARM_FEATURE_MATMUL_INT8 flag is injected into the whisper-rs-sys
+        # cmake build via config.cflag()/config.cxxflag() inside prepare-whisper.ps1.
+        # That patch is necessary because the cmake Rust crate computes CMAKE_C_FLAGS
+        # from the cc crate and appends it after any config.define() calls, so env
+        # vars like CMAKE_C_FLAGS or CFLAGS are silently overridden.
+        run: npm run tauri -- build --bundles dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: contextcall-mac-dmg
+          path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

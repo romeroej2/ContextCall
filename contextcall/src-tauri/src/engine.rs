@@ -1,0 +1,5366 @@
+// Platform-specific system audio capture.
+// On macOS: ScreenCaptureKit-based loopback.
+// On Windows: WASAPI loopback.
+// Other: no-op stub (from audio_windows non-Windows branch).
+#[cfg(target_os = "macos")]
+use crate::audio_macos::MacosAudioCapture as SystemAudioCapture;
+#[cfg(not(target_os = "macos"))]
+use crate::audio_windows::SystemAudioCapture;
+use contextcall_core::{
+    audio::{
+        cpal_mic::CpalMicCapture,
+        echo_cancel::{EchoReferenceBuffer, MicEchoProcessor},
+        recorder::AudioRecorder,
+        AudioCaptureService, MicCaptureService,
+    },
+    download,
+    intelligence::{
+        codex_client::{self, CodexCliConfig, CodexTokenUsage},
+        embedding_client,
+        knowledge_base::{KbChunk, KnowledgeBase},
+        llm_client::{strip_fences, Message},
+        notes_engine,
+        suggestion_engine::SuggestionEngine,
+    },
+    keychain, llama_server,
+    models::{EnhancedNotes, MeetingTemplate, SessionRecord, Speaker, SuggestionFeedbackEntry},
+    process_control::process_registry,
+    settings::{AppSettings, MicCaptureMode},
+    storage::{
+        obsidian::{normalize_relative_folder, ObsidianVaultConfig},
+        session_store::SessionStore,
+        template_store::TemplateStore,
+        transcript_logger::TranscriptLogger,
+    },
+    transcription::{
+        cohere_transcribe::{self, CohereTranscribeConfig},
+        faster_whisper::{self, FasterWhisperConfig},
+        omni_asr::{self, OmniAsrConfig},
+        parakeet::{self, ParakeetConfig, ParakeetWorker},
+        streaming_transcriber::{SegmentProgress, StreamingTranscriber, SttBackend},
+    },
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri_plugin_dialog::DialogExt;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutEvent, ShortcutState};
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use uuid::Uuid;
+
+const OVERLAY_LABEL: &str = "overlay";
+const OVERLAY_SUGGESTION_EVENT: &str = "overlay-suggestion";
+const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const PARAKEET_WARM_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParakeetWorkerSlot {
+    Mic,
+    Sys,
+}
+
+struct CachedParakeetWorker {
+    worker: ParakeetWorker,
+    config_key: String,
+    cached_at: Instant,
+}
+
+impl CachedParakeetWorker {
+    fn new(config: &ParakeetConfig, worker: ParakeetWorker) -> Self {
+        Self {
+            worker,
+            config_key: config.runtime_cache_key(),
+            cached_at: Instant::now(),
+        }
+    }
+}
+
+fn parakeet_cache_entry_is_valid(
+    cached_key: &str,
+    expected_key: &str,
+    cached_at: Instant,
+    now: Instant,
+) -> bool {
+    cached_key == expected_key && now.duration_since(cached_at) <= PARAKEET_WARM_TTL
+}
+
+fn parakeet_slot_label(slot: ParakeetWorkerSlot) -> &'static str {
+    match slot {
+        ParakeetWorkerSlot::Mic => "mic",
+        ParakeetWorkerSlot::Sys => "sys",
+    }
+}
+
+fn parakeet_warmup_slots() -> [ParakeetWorkerSlot; 2] {
+    [ParakeetWorkerSlot::Sys, ParakeetWorkerSlot::Mic]
+}
+
+fn ensure_overlay_window(app: &AppHandle) -> Result<WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+        return Ok(window);
+    }
+
+    let window = WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::default())
+        .title("ContextCall Overlay")
+        .inner_size(380.0, 160.0)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .visible(false)
+        .skip_taskbar(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    Ok(window)
+}
+
+fn emit_overlay_suggestion(window: WebviewWindow, payload: SuggestionPayload) {
+    tauri::async_runtime::spawn(async move {
+        for delay_ms in [0_u64, 150, 500] {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            let _ = window.emit(OVERLAY_SUGGESTION_EVENT, &payload);
+        }
+    });
+}
+
+// ── Payloads ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptPayload {
+    pub text: String,
+    pub speaker: String,
+    pub participant_id: String,
+    pub participant_label: String,
+}
+
+#[derive(Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeysPayload {
+    pub open_router_api_key: String,
+    pub voyage_api_key: String,
+    pub open_ai_llm_api_key: String,
+    pub open_ai_embed_api_key: String,
+    pub hugging_face_token: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioLevelPayload {
+    pub mic_input: f32,
+    pub mic_post_gate: f32,
+    pub them: f32,
+    pub mic_transmit_active: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingFilesPayload {
+    pub mic_path: String,
+    pub sys_path: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct CalibrationAudioLevelPayload {
+    pub level: f32,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionProgressPayload {
+    pub captured_segments: u32,
+    pub processed_segments: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageRecord {
+    pub id: String,
+    pub timestamp: String,
+    pub request_kind: String,
+    pub model: Option<String>,
+    pub success: bool,
+    pub outcome: String,
+    pub fallback_provider: Option<String>,
+    pub duration_ms: u128,
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub estimated_metered_cost_usd: Option<f64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUsageSummary {
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub fallback_requests: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub unknown_token_requests: u64,
+    pub estimated_metered_cost_usd: Option<f64>,
+    pub billing_note: String,
+    pub ledger_path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SttStatusPayload {
+    pub selected_provider: String,
+    pub effective_provider: String,
+    pub selected_model: String,
+    pub effective_model: String,
+    pub selected_provider_ready: bool,
+    pub ready: bool,
+    pub using_fallback: bool,
+    pub download_required: bool,
+    pub message: String,
+    /// True while Parakeet workers are pre-warming in the background.
+    pub parakeet_warming: bool,
+    /// True while OmniASR workers are pre-warming in the background.
+    pub omni_asr_warming: bool,
+    /// True while Cohere Transcribe workers are pre-warming in the background.
+    pub cohere_transcribe_warming: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SttSetupStatusPayload {
+    pub stage: String,
+    pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlamaServerStatusPayload {
+    pub binary_ready: bool,
+    pub model_ready: bool,
+    pub mmproj_ready: bool,
+    pub ready: bool,
+    pub running: bool,
+    pub port: u16,
+    pub model_source: Option<String>,
+    pub model_path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionPayload {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+    pub kb_hits: Vec<contextcall_core::models::KBResult>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionCheckPayload {
+    pub checked_at: String,
+    pub surfaced: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDetailsPayload {
+    pub transcript: Vec<SessionRecord>,
+    pub notes: Option<EnhancedNotes>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotesPublishStatusPayload {
+    pub session_id: String,
+    pub stage: String,
+    pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotesReadyPayload {
+    pub session_id: String,
+    pub notes: EnhancedNotes,
+}
+
+fn emit_notes_publish_status(
+    app: &AppHandle,
+    session_id: &str,
+    stage: &str,
+    message: impl Into<String>,
+) {
+    let _ = app.emit(
+        "notes-publish-status",
+        &NotesPublishStatusPayload {
+            session_id: session_id.to_string(),
+            stage: stage.to_string(),
+            message: message.into(),
+        },
+    );
+}
+
+fn emit_notes_ready(app: &AppHandle, session_id: &str, notes: &EnhancedNotes) {
+    let _ = app.emit(
+        "notes-ready",
+        &NotesReadyPayload {
+            session_id: session_id.to_string(),
+            notes: notes.clone(),
+        },
+    );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NotesGenerationBehavior {
+    emit_chunks: bool,
+    persist_notes: bool,
+    publish_to_obsidian: bool,
+    emit_status: bool,
+}
+
+impl NotesGenerationBehavior {
+    fn persisted(emit_chunks: bool) -> Self {
+        Self {
+            emit_chunks,
+            persist_notes: true,
+            publish_to_obsidian: true,
+            emit_status: true,
+        }
+    }
+
+    fn preview() -> Self {
+        Self {
+            emit_chunks: true,
+            persist_notes: false,
+            publish_to_obsidian: false,
+            emit_status: false,
+        }
+    }
+}
+
+// ── AppState ────────────────────────────────────────────────────────────────
+
+pub struct AppState {
+    pub settings: Mutex<AppSettings>,
+    pub session_store: Mutex<SessionStore>,
+    pub template_store: Mutex<TemplateStore>,
+    pub transcript_logger: Mutex<TranscriptLogger>,
+    pub knowledge_base: AsyncMutex<KnowledgeBase>,
+    pub kb_search_snapshot: AsyncRwLock<Arc<Vec<KbChunk>>>,
+    pub suggestion_engine: AsyncMutex<SuggestionEngine>,
+    pub audio_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    pub system_audio_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    pub suggestion_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    pub poll_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    pub overlay_suggestion: Mutex<Option<SuggestionPayload>>,
+    pub is_running: Mutex<bool>,
+    pub stop_requested: Arc<std::sync::atomic::AtomicBool>,
+    pub mic_gate_threshold: Arc<AtomicU32>,
+    pub mic_input_level: Arc<AtomicU32>,
+    pub mic_level: Arc<AtomicU32>,
+    pub mic_transmit_button_active: Arc<AtomicBool>,
+    pub mic_transmit_shortcut_active: Arc<AtomicBool>,
+    pub mic_transmit_active: Arc<AtomicBool>,
+    pub registered_push_to_talk_shortcut: Mutex<Option<String>>,
+    pub sys_level: Arc<AtomicU32>,
+    pub captured_segments: Arc<AtomicU32>,
+    pub processed_segments: Arc<AtomicU32>,
+    /// Cached Parakeet worker for microphone audio reuse between sessions.
+    warmed_parakeet_mic: Mutex<Option<CachedParakeetWorker>>,
+    /// Cached Parakeet worker for system audio reuse between sessions.
+    warmed_parakeet_sys: Mutex<Option<CachedParakeetWorker>>,
+    /// True while Parakeet workers are being pre-warmed in the background.
+    pub parakeet_warming: Arc<std::sync::atomic::AtomicBool>,
+    /// Pre-warmed OmniASR worker for microphone audio.
+    pub warmed_omni_asr_mic: Mutex<Option<omni_asr::OmniAsrWorker>>,
+    /// Pre-warmed OmniASR worker for system audio.
+    pub warmed_omni_asr_sys: Mutex<Option<omni_asr::OmniAsrWorker>>,
+    /// True while OmniASR workers are being pre-warmed in the background.
+    pub omni_asr_warming: Arc<std::sync::atomic::AtomicBool>,
+    /// Pre-warmed Cohere Transcribe worker for microphone audio.
+    pub warmed_cohere_transcribe_mic: Mutex<Option<cohere_transcribe::CohereTranscribeWorker>>,
+    /// Pre-warmed Cohere Transcribe worker for system audio.
+    pub warmed_cohere_transcribe_sys: Mutex<Option<cohere_transcribe::CohereTranscribeWorker>>,
+    /// True while Cohere Transcribe workers are being pre-warmed in the background.
+    pub cohere_transcribe_warming: Arc<std::sync::atomic::AtomicBool>,
+    pub preview_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    pub preview_stop: Arc<std::sync::atomic::AtomicBool>,
+    pub shutdown_in_progress: Arc<AtomicBool>,
+    pub exit_allowed: Arc<AtomicBool>,
+    /// Holds the active audio recorder when the user opted in before the session.
+    /// Populated by start_transcription, cleared by discard_recording_files.
+    pub audio_recorder: Mutex<Option<std::sync::Arc<AudioRecorder>>>,
+}
+
+impl AppState {
+    fn persistent_data_dir() -> PathBuf {
+        AppSettings::default_path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf()
+    }
+
+    pub fn new() -> Self {
+        let settings = AppSettings::load();
+        let initial_mic_gate_threshold = mic_gate_threshold(&settings).to_bits();
+        let initial_mic_transmit_active = mic_transmit_enabled_by_default(&settings);
+        let kb_cache = Self::persistent_data_dir().join("kb_cache.json");
+        let kb_context = knowledge_base_context(&settings, kb_cache);
+        let knowledge_base = KnowledgeBase::new(
+            kb_context.cache_path,
+            kb_context.config_fingerprint,
+            kb_context.root_marker,
+        );
+        let kb_search_snapshot = Arc::new(knowledge_base.chunks.clone());
+        Self {
+            knowledge_base: AsyncMutex::new(knowledge_base),
+            kb_search_snapshot: AsyncRwLock::new(kb_search_snapshot),
+            suggestion_engine: AsyncMutex::new(SuggestionEngine::new()),
+            session_store: Mutex::new(SessionStore::with_default_path()),
+            template_store: Mutex::new(TemplateStore::load()),
+            transcript_logger: Mutex::new(TranscriptLogger::with_default_path()),
+            settings: Mutex::new(settings),
+            audio_task: Mutex::new(None),
+            system_audio_task: Mutex::new(None),
+            suggestion_task: Mutex::new(None),
+            poll_task: Mutex::new(None),
+            overlay_suggestion: Mutex::new(None),
+            is_running: Mutex::new(false),
+            stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mic_gate_threshold: Arc::new(AtomicU32::new(initial_mic_gate_threshold)),
+            mic_input_level: Arc::new(AtomicU32::new(0)),
+            mic_level: Arc::new(AtomicU32::new(0)),
+            mic_transmit_button_active: Arc::new(AtomicBool::new(false)),
+            mic_transmit_shortcut_active: Arc::new(AtomicBool::new(false)),
+            mic_transmit_active: Arc::new(AtomicBool::new(initial_mic_transmit_active)),
+            registered_push_to_talk_shortcut: Mutex::new(None),
+            sys_level: Arc::new(AtomicU32::new(0)),
+            captured_segments: Arc::new(AtomicU32::new(0)),
+            processed_segments: Arc::new(AtomicU32::new(0)),
+            warmed_parakeet_mic: Mutex::new(None),
+            warmed_parakeet_sys: Mutex::new(None),
+            parakeet_warming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warmed_omni_asr_mic: Mutex::new(None),
+            warmed_omni_asr_sys: Mutex::new(None),
+            omni_asr_warming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            warmed_cohere_transcribe_mic: Mutex::new(None),
+            warmed_cohere_transcribe_sys: Mutex::new(None),
+            cohere_transcribe_warming: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            preview_task: Mutex::new(None),
+            preview_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_in_progress: Arc::new(AtomicBool::new(false)),
+            exit_allowed: Arc::new(AtomicBool::new(false)),
+            audio_recorder: Mutex::new(None),
+        }
+    }
+
+    pub fn begin_shutdown(&self) -> bool {
+        !self.shutdown_in_progress.swap(true, Ordering::Relaxed)
+    }
+
+    pub fn exit_is_allowed(&self) -> bool {
+        self.exit_allowed.load(Ordering::Relaxed)
+    }
+
+    pub fn allow_exit(&self) {
+        self.exit_allowed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn whisper_models_dir() -> PathBuf {
+        Self::persistent_data_dir().join("stt").join("whisper-rs")
+    }
+
+    pub fn legacy_whisper_model_path(model: &str) -> PathBuf {
+        Self::persistent_data_dir().join(contextcall_core::download::model_filename(model))
+    }
+
+    pub fn whisper_model_path_for(_app: &AppHandle, model: &str) -> Result<PathBuf, String> {
+        let provider_path =
+            Self::whisper_models_dir().join(contextcall_core::download::model_filename(model));
+        if provider_path.exists() {
+            Ok(provider_path)
+        } else {
+            let legacy_path = Self::legacy_whisper_model_path(model);
+            if legacy_path.exists() {
+                Ok(legacy_path)
+            } else {
+                Ok(provider_path)
+            }
+        }
+    }
+
+    pub fn faster_whisper_root() -> PathBuf {
+        Self::persistent_data_dir()
+            .join("stt")
+            .join("faster-whisper")
+    }
+
+    pub fn faster_whisper_config(settings: &AppSettings) -> FasterWhisperConfig {
+        let runtime_root = Self::faster_whisper_root();
+        FasterWhisperConfig {
+            worker_script_path: runtime_root.join("worker.py"),
+            requirements_path: runtime_root.join("requirements.txt"),
+            venv_path: runtime_root.join("venv"),
+            models_dir: runtime_root.join("models"),
+            runtime_root,
+            model: settings.faster_whisper_model.clone(),
+            device: settings.faster_whisper_device.clone(),
+            compute_type: settings.faster_whisper_compute_type.clone(),
+        }
+    }
+
+    pub fn parakeet_root() -> PathBuf {
+        Self::persistent_data_dir().join("stt").join("parakeet")
+    }
+
+    pub fn parakeet_config(settings: &AppSettings) -> ParakeetConfig {
+        let runtime_root = Self::parakeet_root();
+        ParakeetConfig {
+            worker_script_path: runtime_root.join("worker.py"),
+            requirements_path: runtime_root.join("requirements.txt"),
+            venv_path: runtime_root.join("venv"),
+            models_dir: runtime_root.join("models"),
+            runtime_root,
+            model: settings.parakeet_model.clone(),
+            device: settings.parakeet_device.clone(),
+            language: settings.transcription_locale.clone(),
+            diarization_enabled: settings.diarization_enabled,
+        }
+    }
+
+    pub fn omni_asr_root() -> PathBuf {
+        Self::persistent_data_dir().join("stt").join("omni-asr")
+    }
+
+    pub fn omni_asr_config(settings: &AppSettings) -> OmniAsrConfig {
+        let runtime_root = Self::omni_asr_root();
+        let use_wsl = cfg!(windows);
+        // The venv must live on WSL's native ext4 filesystem so that PyTorch's
+        // shared libraries (.so) can be loaded. /mnt/c/... (NTFS) does not work.
+        let wsl_venv_linux_path = if use_wsl {
+            omni_asr::detect_wsl_venv_linux_path()
+        } else {
+            String::new()
+        };
+        OmniAsrConfig {
+            worker_script_path: runtime_root.join("worker.py"),
+            requirements_path: runtime_root.join("requirements.txt"),
+            venv_path: runtime_root.join("venv"),
+            models_dir: runtime_root.join("models"),
+            runtime_root,
+            model: settings.omni_asr_model.clone(),
+            device: settings.omni_asr_device.clone(),
+            lang: omni_asr::locale_to_fairseq_lang(&settings.transcription_locale),
+            use_wsl,
+            wsl_venv_linux_path,
+        }
+    }
+
+    pub fn cohere_transcribe_root() -> PathBuf {
+        Self::persistent_data_dir()
+            .join("stt")
+            .join("cohere-transcribe")
+    }
+
+    pub fn cohere_transcribe_config(settings: &AppSettings) -> CohereTranscribeConfig {
+        let runtime_root = Self::cohere_transcribe_root();
+        let use_wsl = cfg!(windows) && settings.cohere_transcribe_device == "wsl-rocm";
+        let device_slug = settings
+            .cohere_transcribe_device
+            .trim()
+            .to_ascii_lowercase()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+        CohereTranscribeConfig {
+            worker_script_path: runtime_root.join("worker.py"),
+            requirements_path: runtime_root.join("requirements.txt"),
+            venv_path: runtime_root.join(format!("venv-{device_slug}")),
+            models_dir: runtime_root.join("models"),
+            runtime_root,
+            model: settings.cohere_transcribe_model.clone(),
+            device: settings.cohere_transcribe_device.clone(),
+            hugging_face_token: keychain::KeyEntry::hugging_face_token()
+                .load()
+                .or_else(|| settings.hugging_face_token.clone()),
+            use_wsl,
+            wsl_venv_linux_path: if use_wsl {
+                omni_asr::detect_wsl_venv_linux_path()
+                    .replace("/omni-asr/", &format!("/cohere-transcribe/{device_slug}/"))
+            } else {
+                String::new()
+            },
+        }
+    }
+}
+
+fn codex_usage_ledger_path() -> PathBuf {
+    AppState::persistent_data_dir().join("codex_usage.jsonl")
+}
+
+fn parakeet_worker_slot(
+    state: &AppState,
+    slot: ParakeetWorkerSlot,
+) -> &Mutex<Option<CachedParakeetWorker>> {
+    match slot {
+        ParakeetWorkerSlot::Mic => &state.warmed_parakeet_mic,
+        ParakeetWorkerSlot::Sys => &state.warmed_parakeet_sys,
+    }
+}
+
+fn store_cached_parakeet_worker(
+    state: Arc<AppState>,
+    slot: ParakeetWorkerSlot,
+    config: ParakeetConfig,
+    worker: ParakeetWorker,
+) {
+    let entry = CachedParakeetWorker::new(&config, worker);
+    let config_key = entry.config_key.clone();
+    let cached_at = entry.cached_at;
+    {
+        let mut guard = parakeet_worker_slot(&state, slot).lock().unwrap();
+        *guard = Some(entry);
+    }
+
+    std::thread::spawn(move || {
+        std::thread::sleep(PARAKEET_WARM_TTL);
+        if state.shutdown_in_progress.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut guard = parakeet_worker_slot(&state, slot).lock().unwrap();
+        let should_evict = guard
+            .as_ref()
+            .map(|entry| entry.config_key == config_key && entry.cached_at == cached_at)
+            .unwrap_or(false);
+        if should_evict {
+            *guard = None;
+            log::info!(
+                "[parakeet] evicted idle {} worker after {:?}",
+                parakeet_slot_label(slot),
+                PARAKEET_WARM_TTL
+            );
+        }
+    });
+}
+
+fn take_cached_parakeet_worker(
+    state: &Arc<AppState>,
+    slot: ParakeetWorkerSlot,
+    config: &ParakeetConfig,
+) -> Option<ParakeetWorker> {
+    let expected_key = config.runtime_cache_key();
+    let now = Instant::now();
+    let mut guard = parakeet_worker_slot(state, slot).lock().unwrap();
+    match guard.take() {
+        Some(entry)
+            if parakeet_cache_entry_is_valid(
+                &entry.config_key,
+                &expected_key,
+                entry.cached_at,
+                now,
+            ) =>
+        {
+            Some(entry.worker)
+        }
+        Some(_) => {
+            log::info!(
+                "[parakeet] dropped stale {} worker cache entry",
+                parakeet_slot_label(slot)
+            );
+            None
+        }
+        None => None,
+    }
+}
+
+fn has_cached_parakeet_worker(
+    state: &Arc<AppState>,
+    slot: ParakeetWorkerSlot,
+    config: &ParakeetConfig,
+) -> bool {
+    let expected_key = config.runtime_cache_key();
+    let now = Instant::now();
+    let mut guard = parakeet_worker_slot(state, slot).lock().unwrap();
+    let is_valid = guard
+        .as_ref()
+        .map(|entry| {
+            parakeet_cache_entry_is_valid(&entry.config_key, &expected_key, entry.cached_at, now)
+        })
+        .unwrap_or(false);
+    if !is_valid {
+        *guard = None;
+    }
+    is_valid
+}
+
+fn warm_parakeet_worker_slot(
+    state: &Arc<AppState>,
+    slot: ParakeetWorkerSlot,
+    config: &ParakeetConfig,
+) -> bool {
+    if has_cached_parakeet_worker(state, slot, config) {
+        return true;
+    }
+
+    let slot_name = parakeet_slot_label(slot);
+    log::info!("[parakeet] pre-warming {slot_name} worker...");
+    match ParakeetWorker::spawn(config) {
+        Ok(mut worker) => match worker.ensure_model(config.diarization_enabled) {
+            Ok(_) => {
+                if state.shutdown_in_progress.load(Ordering::Relaxed) {
+                    log::info!(
+                        "[parakeet] dropping {slot_name} worker because shutdown is in progress"
+                    );
+                    false
+                } else {
+                    store_cached_parakeet_worker(Arc::clone(state), slot, config.clone(), worker);
+                    log::info!("[parakeet] {slot_name} worker pre-warmed and ready");
+                    true
+                }
+            }
+            Err(err) => {
+                log::warn!("[parakeet] {slot_name} worker ensure_model failed: {err}");
+                false
+            }
+        },
+        Err(err) => {
+            log::warn!("[parakeet] failed to pre-warm {slot_name} worker: {err}");
+            false
+        }
+    }
+}
+
+fn mic_gate_threshold(settings: &AppSettings) -> f32 {
+    settings.mic_calibration_rms.unwrap_or(0.0) * settings.mic_threshold_multiplier
+}
+
+fn mic_transmit_enabled_by_default(settings: &AppSettings) -> bool {
+    settings.mic_capture_mode != MicCaptureMode::PushToTalk
+}
+
+fn mic_transmit_active_for_sources(
+    settings: &AppSettings,
+    button_active: bool,
+    shortcut_active: bool,
+) -> bool {
+    if settings.mic_capture_mode == MicCaptureMode::PushToTalk {
+        button_active || shortcut_active
+    } else {
+        true
+    }
+}
+
+fn refresh_mic_transmit_active(state: &AppState, settings: &AppSettings) {
+    state.mic_transmit_active.store(
+        mic_transmit_active_for_sources(
+            settings,
+            state.mic_transmit_button_active.load(Ordering::Relaxed),
+            state.mic_transmit_shortcut_active.load(Ordering::Relaxed),
+        ),
+        Ordering::Relaxed,
+    );
+}
+
+fn reset_mic_transmit_sources(state: &AppState, settings: &AppSettings) {
+    state
+        .mic_transmit_button_active
+        .store(false, Ordering::Relaxed);
+    state
+        .mic_transmit_shortcut_active
+        .store(false, Ordering::Relaxed);
+    refresh_mic_transmit_active(state, settings);
+}
+
+fn push_to_talk_shortcut_for_plugin(shortcut: &str) -> Result<String, String> {
+    let tokens: Vec<&str> = shortcut
+        .split('+')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        return Err("Push-to-talk shortcut cannot be empty.".into());
+    }
+
+    let mut mapped = Vec::with_capacity(tokens.len());
+    let mut saw_key = false;
+
+    for token in tokens {
+        let plugin_token = match token {
+            "Ctrl" => "ctrl".to_string(),
+            "Alt" => "alt".to_string(),
+            "Shift" => "shift".to_string(),
+            "Meta" => "super".to_string(),
+            "Space" => "space".to_string(),
+            "Enter" => "enter".to_string(),
+            "Escape" => "escape".to_string(),
+            "Tab" => "tab".to_string(),
+            "Backspace" => "backspace".to_string(),
+            "Delete" => "delete".to_string(),
+            "ArrowLeft" => "left".to_string(),
+            "ArrowRight" => "right".to_string(),
+            "ArrowUp" => "up".to_string(),
+            "ArrowDown" => "down".to_string(),
+            "Minus" => "minus".to_string(),
+            "Plus" => "equal".to_string(),
+            "Quote" => "quote".to_string(),
+            "Semicolon" => "semicolon".to_string(),
+            "Slash" => "slash".to_string(),
+            "Comma" => "comma".to_string(),
+            "Period" => "period".to_string(),
+            "BracketLeft" => "bracketleft".to_string(),
+            "BracketRight" => "bracketright".to_string(),
+            "Backslash" => "backslash".to_string(),
+            "Backquote" => "backquote".to_string(),
+            other if other.len() == 1 && other.chars().all(|ch| ch.is_ascii_alphanumeric()) => {
+                saw_key = true;
+                other.to_ascii_lowercase()
+            }
+            other if other.starts_with('F') && other[1..].chars().all(|ch| ch.is_ascii_digit()) => {
+                saw_key = true;
+                other.to_ascii_lowercase()
+            }
+            other => {
+                return Err(format!(
+                    "Push-to-talk shortcut key `{other}` is not supported for the global hotkey."
+                ));
+            }
+        };
+
+        if !matches!(token, "Ctrl" | "Alt" | "Shift" | "Meta") {
+            saw_key = true;
+        }
+
+        mapped.push(plugin_token);
+    }
+
+    if !saw_key {
+        return Err("Push-to-talk shortcut must include a non-modifier key.".into());
+    }
+
+    Ok(mapped.join("+"))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn sync_push_to_talk_shortcut_registration(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    settings: &AppSettings,
+    should_register: bool,
+) -> Result<(), String> {
+    let desired_shortcut =
+        if should_register && settings.mic_capture_mode == MicCaptureMode::PushToTalk {
+            Some(push_to_talk_shortcut_for_plugin(
+                &settings.push_to_talk_hotkey,
+            )?)
+        } else {
+            None
+        };
+
+    let mut registered_shortcut = state.registered_push_to_talk_shortcut.lock().unwrap();
+
+    if registered_shortcut.as_ref() == desired_shortcut.as_ref() {
+        return Ok(());
+    }
+
+    if let Some(desired) = desired_shortcut.as_ref() {
+        app.global_shortcut()
+            .register(desired.as_str())
+            .map_err(|error| {
+                format!(
+                    "Failed to register push-to-talk hotkey `{}`: {error}",
+                    settings.push_to_talk_hotkey
+                )
+            })?;
+    }
+
+    if let Some(existing) = registered_shortcut.take() {
+        if let Err(error) = app.global_shortcut().unregister(existing.as_str()) {
+            log::warn!("Failed to unregister previous push-to-talk shortcut `{existing}`: {error}");
+        }
+    }
+
+    *registered_shortcut = desired_shortcut;
+
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn sync_push_to_talk_shortcut_registration(
+    _app: &AppHandle,
+    _state: &Arc<AppState>,
+    _settings: &AppSettings,
+    _should_register: bool,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn handle_global_shortcut_event(
+    app: &AppHandle,
+    _shortcut: &tauri_plugin_global_shortcut::Shortcut,
+    event: ShortcutEvent,
+) {
+    let state = app.state::<Arc<AppState>>();
+    let settings = state.settings.lock().unwrap().clone();
+
+    if settings.mic_capture_mode != MicCaptureMode::PushToTalk {
+        return;
+    }
+
+    if !*state.is_running.lock().unwrap() {
+        state
+            .mic_transmit_shortcut_active
+            .store(false, Ordering::Relaxed);
+        refresh_mic_transmit_active(&state, &settings);
+        return;
+    }
+
+    let next_active = match event.state {
+        ShortcutState::Pressed => true,
+        ShortcutState::Released => false,
+    };
+
+    state
+        .mic_transmit_shortcut_active
+        .store(next_active, Ordering::Relaxed);
+    refresh_mic_transmit_active(&state, &settings);
+}
+
+fn resolve_whisper_model(settings: &AppSettings) -> &'static str {
+    let locale = settings.transcription_locale.trim().to_ascii_lowercase();
+    let is_english = locale.is_empty() || locale.starts_with("en");
+
+    match settings.whisper_model.as_str() {
+        "tiny" => {
+            if is_english {
+                "tiny-en"
+            } else {
+                "tiny"
+            }
+        }
+        "tiny-en" => "tiny-en",
+        "base" => {
+            if is_english {
+                "base-en"
+            } else {
+                "base"
+            }
+        }
+        "base-en" => "base-en",
+        "small" => {
+            if is_english {
+                "small-en"
+            } else {
+                "small"
+            }
+        }
+        "small-en" => "small-en",
+        "medium" => {
+            if is_english {
+                "medium-en"
+            } else {
+                "medium"
+            }
+        }
+        "medium-en" => "medium-en",
+        "large-v3-turbo" => "large-v3-turbo",
+        "auto" => "base",
+        _ => "base",
+    }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ParakeetWarmupStatus {
+    ready: bool,
+    message: String,
+}
+
+/// Spawn background threads to pre-warm Parakeet workers so the model is loaded and ready
+/// before the user clicks record. Emits `parakeet-warmup-status` events so the UI can show
+/// a loading indicator. Safe to call at any time — does nothing if parakeet is not configured
+/// or not ready (not installed / model not downloaded).
+pub fn warm_parakeet_workers(state: Arc<AppState>, app: AppHandle) {
+    if state.shutdown_in_progress.load(Ordering::Relaxed) {
+        return;
+    }
+    let settings = state.settings.lock().unwrap().clone();
+    if selected_stt_provider(&settings) != "parakeet" {
+        return;
+    }
+    let config = AppState::parakeet_config(&settings);
+    if !config.is_installed() || !parakeet::model_storage_exists(&config) {
+        return;
+    }
+    let [first_slot, second_slot] = parakeet_warmup_slots();
+    let first_ready = has_cached_parakeet_worker(&state, first_slot, &config);
+    let second_ready = has_cached_parakeet_worker(&state, second_slot, &config);
+    if first_ready && second_ready {
+        return;
+    }
+    // Don't start a second warmup if one is already in progress.
+    if state.parakeet_warming.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let should_gate_until_first_ready = !first_ready;
+    if should_gate_until_first_ready {
+        app.emit(
+            "parakeet-warmup-status",
+            &ParakeetWarmupStatus {
+                ready: false,
+                message: format!(
+                    "Parakeet engine loading {} worker...",
+                    parakeet_slot_label(first_slot)
+                ),
+            },
+        )
+        .ok();
+    }
+
+    let state_clone = Arc::clone(&state);
+    let config_clone = config.clone();
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        let first_warm_succeeded =
+            warm_parakeet_worker_slot(&state_clone, first_slot, &config_clone);
+        state_clone.parakeet_warming.store(false, Ordering::Relaxed);
+        if state_clone.shutdown_in_progress.load(Ordering::Relaxed) {
+            return;
+        }
+
+        if should_gate_until_first_ready {
+            app_clone
+                .emit(
+                    "parakeet-warmup-status",
+                    &ParakeetWarmupStatus {
+                        ready: true,
+                        message: if first_warm_succeeded {
+                            format!(
+                                "Parakeet {} worker ready; warming {} in background.",
+                                parakeet_slot_label(first_slot),
+                                parakeet_slot_label(second_slot)
+                            )
+                        } else {
+                            "Parakeet warmup finished without a cached worker".into()
+                        },
+                    },
+                )
+                .ok();
+        }
+
+        if first_warm_succeeded
+            && !second_ready
+            && !state_clone.shutdown_in_progress.load(Ordering::Relaxed)
+        {
+            warm_parakeet_worker_slot(&state_clone, second_slot, &config_clone);
+        }
+    });
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OmniAsrWarmupStatus {
+    ready: bool,
+    message: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CohereTranscribeWarmupStatus {
+    ready: bool,
+    message: String,
+}
+
+/// Spawn background threads to pre-warm OmniASR workers so the model is loaded and ready
+/// before the user clicks record. Emits `omni-asr-warmup-status` events so the UI can show
+/// a loading indicator. Safe to call at any time — does nothing if omni-asr is not configured
+/// or not ready (not installed / model not downloaded).
+pub fn warm_omni_asr_workers(state: Arc<AppState>, app: AppHandle) {
+    if state.shutdown_in_progress.load(Ordering::Relaxed) {
+        return;
+    }
+    let settings = state.settings.lock().unwrap().clone();
+    if selected_stt_provider(&settings) != "omni-asr" {
+        return;
+    }
+    let config = AppState::omni_asr_config(&settings);
+    if !config.is_installed() || !omni_asr::model_storage_exists(&config) {
+        return;
+    }
+    // Don't start a second warmup if one is already in progress.
+    if state.omni_asr_warming.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    app.emit(
+        "omni-asr-warmup-status",
+        &OmniAsrWarmupStatus {
+            ready: false,
+            message: "OmniASR engine loading...".into(),
+        },
+    )
+    .ok();
+
+    // Counter: decremented by each thread; last one to finish emits "ready".
+    let remaining = Arc::new(std::sync::atomic::AtomicU32::new(2));
+
+    for slot_name in ["mic", "sys"] {
+        let state_clone = Arc::clone(&state);
+        let config_clone = config.clone();
+        let app_clone = app.clone();
+        let remaining_clone = Arc::clone(&remaining);
+        let name = slot_name;
+        std::thread::spawn(move || {
+            log::info!("[omni-asr] pre-warming {name} worker...");
+            match omni_asr::OmniAsrWorker::spawn(&config_clone) {
+                Ok(mut worker) => match worker.ensure_model() {
+                    Ok(_) => {
+                        if state_clone.shutdown_in_progress.load(Ordering::Relaxed) {
+                            log::info!(
+                                "[omni-asr] dropping {name} worker because shutdown is in progress"
+                            );
+                            return;
+                        }
+                        let mut slot = if name == "mic" {
+                            state_clone.warmed_omni_asr_mic.lock().unwrap()
+                        } else {
+                            state_clone.warmed_omni_asr_sys.lock().unwrap()
+                        };
+                        *slot = Some(worker);
+                        log::info!("[omni-asr] {name} worker pre-warmed and ready");
+                    }
+                    Err(e) => log::warn!("[omni-asr] {name} worker ensure_model failed: {e}"),
+                },
+                Err(e) => log::warn!("[omni-asr] failed to pre-warm {name} worker: {e}"),
+            }
+            // When the last thread finishes, clear the warming flag and notify the UI.
+            if remaining_clone.fetch_sub(1, Ordering::Relaxed) == 1 {
+                state_clone.omni_asr_warming.store(false, Ordering::Relaxed);
+                if state_clone.shutdown_in_progress.load(Ordering::Relaxed) {
+                    return;
+                }
+                app_clone
+                    .emit(
+                        "omni-asr-warmup-status",
+                        &OmniAsrWarmupStatus {
+                            ready: true,
+                            message: "OmniASR engine ready".into(),
+                        },
+                    )
+                    .ok();
+                log::info!("[omni-asr] all workers pre-warmed");
+            }
+        });
+    }
+}
+
+pub fn warm_cohere_transcribe_workers(state: Arc<AppState>, app: AppHandle) {
+    if state.shutdown_in_progress.load(Ordering::Relaxed) {
+        return;
+    }
+    let settings = state.settings.lock().unwrap().clone();
+    if selected_stt_provider(&settings) != "cohere-transcribe" {
+        return;
+    }
+    let config = AppState::cohere_transcribe_config(&settings);
+    let has_token = config
+        .hugging_face_token
+        .as_deref()
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false);
+    if !has_token
+        || !config.is_installed()
+        || !cohere_transcribe::model_storage_exists(&config)
+        || !cohere_transcribe::supports_locale(&settings.transcription_locale)
+    {
+        return;
+    }
+    if state
+        .cohere_transcribe_warming
+        .swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    app.emit(
+        "cohere-transcribe-warmup-status",
+        &CohereTranscribeWarmupStatus {
+            ready: false,
+            message: "Cohere Transcribe engine loading...".into(),
+        },
+    )
+    .ok();
+
+    let remaining = Arc::new(std::sync::atomic::AtomicU32::new(2));
+
+    for slot_name in ["mic", "sys"] {
+        let state_clone = Arc::clone(&state);
+        let config_clone = config.clone();
+        let app_clone = app.clone();
+        let remaining_clone = Arc::clone(&remaining);
+        let name = slot_name;
+        std::thread::spawn(move || {
+            log::info!("[cohere-transcribe] pre-warming {name} worker...");
+            match cohere_transcribe::CohereTranscribeWorker::spawn(&config_clone) {
+                Ok(mut worker) => match worker.ensure_model() {
+                    Ok(_) => {
+                        if state_clone.shutdown_in_progress.load(Ordering::Relaxed) {
+                            log::info!(
+                                "[cohere-transcribe] dropping {name} worker because shutdown is in progress"
+                            );
+                            return;
+                        }
+                        let mut slot = if name == "mic" {
+                            state_clone.warmed_cohere_transcribe_mic.lock().unwrap()
+                        } else {
+                            state_clone.warmed_cohere_transcribe_sys.lock().unwrap()
+                        };
+                        *slot = Some(worker);
+                        log::info!("[cohere-transcribe] {name} worker pre-warmed and ready");
+                    }
+                    Err(e) => {
+                        log::warn!("[cohere-transcribe] {name} worker ensure_model failed: {e}")
+                    }
+                },
+                Err(e) => log::warn!("[cohere-transcribe] failed to pre-warm {name} worker: {e}"),
+            }
+            if remaining_clone.fetch_sub(1, Ordering::Relaxed) == 1 {
+                state_clone
+                    .cohere_transcribe_warming
+                    .store(false, Ordering::Relaxed);
+                if state_clone.shutdown_in_progress.load(Ordering::Relaxed) {
+                    return;
+                }
+                app_clone
+                    .emit(
+                        "cohere-transcribe-warmup-status",
+                        &CohereTranscribeWarmupStatus {
+                            ready: true,
+                            message: "Cohere Transcribe engine ready".into(),
+                        },
+                    )
+                    .ok();
+                log::info!("[cohere-transcribe] all workers pre-warmed");
+            }
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StopBehavior {
+    await_notes: bool,
+    restart_warmups: bool,
+}
+
+impl StopBehavior {
+    fn user_stop() -> Self {
+        Self {
+            await_notes: false,
+            restart_warmups: true,
+        }
+    }
+
+    fn app_exit() -> Self {
+        Self {
+            await_notes: true,
+            restart_warmups: false,
+        }
+    }
+}
+
+fn clear_warmed_workers(state: &Arc<AppState>) {
+    *state.warmed_parakeet_mic.lock().unwrap() = None;
+    *state.warmed_parakeet_sys.lock().unwrap() = None;
+    *state.warmed_omni_asr_mic.lock().unwrap() = None;
+    *state.warmed_omni_asr_sys.lock().unwrap() = None;
+    *state.warmed_cohere_transcribe_mic.lock().unwrap() = None;
+    *state.warmed_cohere_transcribe_sys.lock().unwrap() = None;
+}
+
+fn stop_preview_task(state: &Arc<AppState>) {
+    state.preview_stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = state.preview_task.lock().unwrap().take() {
+        handle.abort();
+    }
+}
+
+async fn finalize_active_recorder(state: &Arc<AppState>) {
+    let recorder = state.audio_recorder.lock().unwrap().take();
+    if let Some(recorder) = recorder {
+        match tokio::task::spawn_blocking(move || recorder.finish()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => log::warn!("Failed to finalize recorder during shutdown: {err}"),
+            Err(err) => log::warn!("Recorder finalization task failed during shutdown: {err}"),
+        }
+    }
+}
+
+async fn stop_transcription_inner(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    behavior: StopBehavior,
+) -> Result<(), String> {
+    let settings = state.settings.lock().unwrap().clone();
+    state.stop_requested.store(true, Ordering::Relaxed);
+
+    let audio_handle = state.audio_task.lock().unwrap().take();
+    let system_audio_handle = state.system_audio_task.lock().unwrap().take();
+    let suggestion_handle = state.suggestion_task.lock().unwrap().take();
+    let poll_handle = state.poll_task.lock().unwrap().take();
+
+    if let Some(handle) = audio_handle {
+        let _ = handle.await;
+    }
+    if let Some(handle) = system_audio_handle {
+        let _ = handle.await;
+    }
+
+    let session_id = state
+        .session_store
+        .lock()
+        .unwrap()
+        .current_session_id()
+        .map(str::to_owned);
+
+    *state.is_running.lock().unwrap() = false;
+    reset_mic_transmit_sources(state, &settings);
+    sync_push_to_talk_shortcut_registration(app, state, &settings, false)?;
+
+    if let Some(handle) = suggestion_handle {
+        handle.abort();
+    }
+    if let Some(handle) = poll_handle {
+        handle.abort();
+    }
+    state.session_store.lock().unwrap().end_session();
+    state.transcript_logger.lock().unwrap().end_session();
+    *state.overlay_suggestion.lock().unwrap() = None;
+    if let Some(overlay) = app.get_webview_window(OVERLAY_LABEL) {
+        let _ = overlay.hide();
+    }
+    state.mic_input_level.store(0u32, Ordering::Relaxed);
+    state.mic_level.store(0u32, Ordering::Relaxed);
+    state.sys_level.store(0u32, Ordering::Relaxed);
+    emit_transcription_progress(app, state);
+
+    if let (Some(session_id), Some(_)) = (session_id, configured_obsidian(&settings)) {
+        if behavior.await_notes {
+            if let Err(err) = generate_notes_for_session(
+                app,
+                state,
+                session_id,
+                None,
+                NotesGenerationBehavior::persisted(false),
+            )
+            .await
+            {
+                log::error!("Failed to auto-publish notes to Obsidian: {err}");
+            }
+        } else {
+            let app_clone = app.clone();
+            let state_clone = Arc::clone(state);
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = generate_notes_for_session(
+                    &app_clone,
+                    &state_clone,
+                    session_id,
+                    None,
+                    NotesGenerationBehavior::persisted(false),
+                )
+                .await
+                {
+                    log::error!("Failed to auto-publish notes to Obsidian: {err}");
+                }
+            });
+        }
+    }
+
+    if behavior.restart_warmups {
+        warm_parakeet_workers(Arc::clone(state), app.clone());
+        warm_omni_asr_workers(Arc::clone(state), app.clone());
+        warm_cohere_transcribe_workers(Arc::clone(state), app.clone());
+    }
+
+    Ok(())
+}
+
+async fn shutdown_application(app: AppHandle, state: Arc<AppState>) {
+    let shutdown_result = tokio::time::timeout(APP_SHUTDOWN_TIMEOUT, async {
+        stop_preview_task(&state);
+        clear_warmed_workers(&state);
+        stop_transcription_inner(&app, &state, StopBehavior::app_exit()).await?;
+        finalize_active_recorder(&state).await;
+        process_registry()
+            .terminate_all()
+            .map_err(|err| format!("Failed terminating tracked child processes: {err}"))?;
+        Ok::<(), String>(())
+    })
+    .await;
+
+    match shutdown_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            log::error!("Application shutdown failed: {err}");
+            if let Err(kill_err) = process_registry().terminate_all() {
+                log::error!(
+                    "Failed terminating tracked child processes after shutdown error: {kill_err}"
+                );
+            }
+        }
+        Err(_) => {
+            log::error!(
+                "Application shutdown exceeded {:?}; force-terminating tracked child processes",
+                APP_SHUTDOWN_TIMEOUT
+            );
+            if let Err(kill_err) = process_registry().terminate_all() {
+                log::error!(
+                    "Failed terminating tracked child processes after shutdown timeout: {kill_err}"
+                );
+            }
+        }
+    }
+
+    state.allow_exit();
+    app.exit(0);
+}
+
+pub fn request_app_shutdown(app: AppHandle) {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    if !state.begin_shutdown() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        shutdown_application(app, state).await;
+    });
+}
+
+pub fn exit_is_allowed(app: &AppHandle) -> bool {
+    app.state::<Arc<AppState>>().exit_is_allowed()
+}
+
+fn selected_stt_provider(settings: &AppSettings) -> &str {
+    match settings.stt_provider.trim() {
+        "faster-whisper" => "faster-whisper",
+        "parakeet" => "parakeet",
+        "omni-asr" => "omni-asr",
+        "cohere-transcribe" => "cohere-transcribe",
+        "llama-server" => "llama-server",
+        _ => "whisper-rs",
+    }
+}
+
+fn resolve_stt_status(app: &AppHandle, settings: &AppSettings) -> SttStatusPayload {
+    let selected_provider = selected_stt_provider(settings).to_string();
+    let whisper_model = resolve_whisper_model(settings).to_string();
+    let whisper_model_path =
+        AppState::whisper_model_path_for(app, &whisper_model).unwrap_or_else(|_| PathBuf::new());
+    let whisper_ready = download::model_exists(&whisper_model_path);
+
+    if selected_provider == "faster-whisper" {
+        let config = AppState::faster_whisper_config(settings);
+        let selected_ready = faster_whisper::health_check(&config).is_ok()
+            && faster_whisper::model_storage_exists(&config);
+
+        if selected_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "faster-whisper".into(),
+                selected_model: config.model.clone(),
+                effective_model: config.model.clone(),
+                selected_provider_ready: true,
+                ready: true,
+                using_fallback: false,
+                download_required: false,
+                message: format!("faster-whisper is ready with {}.", config.model),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        if whisper_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "whisper-rs".into(),
+                selected_model: config.model.clone(),
+                effective_model: whisper_model,
+                selected_provider_ready: false,
+                ready: true,
+                using_fallback: true,
+                download_required: true,
+                message: "faster-whisper is unavailable. Falling back to whisper-rs.".into(),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        return SttStatusPayload {
+            selected_provider,
+            effective_provider: "faster-whisper".into(),
+            selected_model: config.model.clone(),
+            effective_model: config.model.clone(),
+            selected_provider_ready: false,
+            ready: false,
+            using_fallback: false,
+            download_required: true,
+            message: "faster-whisper needs setup before transcription can start.".into(),
+            parakeet_warming: false,
+            omni_asr_warming: false,
+            cohere_transcribe_warming: false,
+        };
+    }
+
+    if selected_provider == "parakeet" {
+        let config = AppState::parakeet_config(settings);
+        let selected_ready =
+            parakeet::health_check(&config).is_ok() && parakeet::model_storage_exists(&config);
+
+        if selected_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "parakeet".into(),
+                selected_model: config.model.clone(),
+                effective_model: config.model.clone(),
+                selected_provider_ready: true,
+                ready: true,
+                using_fallback: false,
+                download_required: false,
+                message: format!("parakeet is ready with {}.", config.model),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        if whisper_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "whisper-rs".into(),
+                selected_model: config.model.clone(),
+                effective_model: whisper_model,
+                selected_provider_ready: false,
+                ready: true,
+                using_fallback: true,
+                download_required: true,
+                message: "parakeet is unavailable. Falling back to whisper-rs.".into(),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        return SttStatusPayload {
+            selected_provider,
+            effective_provider: "parakeet".into(),
+            selected_model: config.model.clone(),
+            effective_model: config.model.clone(),
+            selected_provider_ready: false,
+            ready: false,
+            using_fallback: false,
+            download_required: true,
+            message: "parakeet needs setup before transcription can start.".into(),
+            parakeet_warming: false,
+            omni_asr_warming: false,
+            cohere_transcribe_warming: false,
+        };
+    }
+
+    if selected_provider == "omni-asr" {
+        let config = AppState::omni_asr_config(settings);
+        let selected_ready =
+            omni_asr::health_check(&config).is_ok() && omni_asr::model_storage_exists(&config);
+
+        if selected_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "omni-asr".into(),
+                selected_model: config.model.clone(),
+                effective_model: config.model.clone(),
+                selected_provider_ready: true,
+                ready: true,
+                using_fallback: false,
+                download_required: false,
+                message: format!("Omni-ASR is ready with {}.", config.model),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        if whisper_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "whisper-rs".into(),
+                selected_model: config.model.clone(),
+                effective_model: whisper_model,
+                selected_provider_ready: false,
+                ready: true,
+                using_fallback: true,
+                download_required: true,
+                message: "Omni-ASR is unavailable. Falling back to whisper-rs.".into(),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        let setup_message = if cfg!(windows) {
+            "Omni-ASR requires WSL2 + Python 3 inside WSL. Click \"Set up\" to install. See README for details.".into()
+        } else {
+            "Omni-ASR needs Python 3 and setup before transcription can start.".into()
+        };
+        return SttStatusPayload {
+            selected_provider,
+            effective_provider: "omni-asr".into(),
+            selected_model: config.model.clone(),
+            effective_model: config.model.clone(),
+            selected_provider_ready: false,
+            ready: false,
+            using_fallback: false,
+            download_required: true,
+            message: setup_message,
+            parakeet_warming: false,
+            omni_asr_warming: false,
+            cohere_transcribe_warming: false,
+        };
+    }
+
+    if selected_provider == "cohere-transcribe" {
+        let config = AppState::cohere_transcribe_config(settings);
+        let locale_supported = cohere_transcribe::supports_locale(&settings.transcription_locale);
+        let has_token = config
+            .hugging_face_token
+            .as_deref()
+            .map(|token| !token.trim().is_empty())
+            .unwrap_or(false);
+        let selected_ready = has_token
+            && locale_supported
+            && cohere_transcribe::health_check(&config).is_ok()
+            && cohere_transcribe::model_storage_exists(&config);
+
+        if selected_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "cohere-transcribe".into(),
+                selected_model: config.model.clone(),
+                effective_model: config.model.clone(),
+                selected_provider_ready: true,
+                ready: true,
+                using_fallback: false,
+                download_required: false,
+                message: format!("Cohere Transcribe is ready with {}.", config.model),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        if whisper_ready {
+            let fallback_message = if !has_token {
+                "Cohere Transcribe needs a Hugging Face token. Falling back to whisper-rs."
+                    .to_string()
+            } else if !locale_supported {
+                format!(
+                    "Cohere Transcribe does not support locale {}. Falling back to whisper-rs.",
+                    settings.transcription_locale
+                )
+            } else {
+                "Cohere Transcribe is unavailable. Falling back to whisper-rs.".into()
+            };
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "whisper-rs".into(),
+                selected_model: config.model.clone(),
+                effective_model: whisper_model,
+                selected_provider_ready: false,
+                ready: true,
+                using_fallback: true,
+                download_required: has_token && locale_supported,
+                message: fallback_message,
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        let setup_message = if !has_token {
+            cohere_transcribe::missing_token_message()
+        } else if !locale_supported {
+            format!(
+                "Cohere Transcribe supports a limited language set and cannot use locale {}.",
+                settings.transcription_locale
+            )
+        } else {
+            "Cohere Transcribe needs setup before transcription can start.".into()
+        };
+        return SttStatusPayload {
+            selected_provider,
+            effective_provider: "cohere-transcribe".into(),
+            selected_model: config.model.clone(),
+            effective_model: config.model.clone(),
+            selected_provider_ready: false,
+            ready: false,
+            using_fallback: false,
+            download_required: has_token && locale_supported,
+            message: setup_message,
+            parakeet_warming: false,
+            omni_asr_warming: false,
+            cohere_transcribe_warming: false,
+        };
+    }
+
+    if selected_provider == "llama-server" {
+        let assets = llama_server::assets_status();
+        let model_label = llama_server::MODEL_NAME.to_string();
+
+        if assets.ready() {
+            let source = assets.model_source.clone().unwrap_or_default();
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "llama-server".into(),
+                selected_model: model_label.clone(),
+                effective_model: model_label,
+                selected_provider_ready: true,
+                ready: true,
+                using_fallback: false,
+                download_required: false,
+                message: if source == "managed" {
+                    "Gemma 4 12B (llama-server) is ready.".into()
+                } else {
+                    format!("Gemma 4 12B (llama-server) is ready, reusing your {source} model files.")
+                },
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        if whisper_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "whisper-rs".into(),
+                selected_model: model_label,
+                effective_model: whisper_model,
+                selected_provider_ready: false,
+                ready: true,
+                using_fallback: true,
+                download_required: true,
+                message: "Gemma 4 (llama-server) needs setup. Falling back to whisper-rs.".into(),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        return SttStatusPayload {
+            selected_provider,
+            effective_provider: "llama-server".into(),
+            selected_model: model_label.clone(),
+            effective_model: model_label,
+            selected_provider_ready: false,
+            ready: false,
+            using_fallback: false,
+            download_required: true,
+            message: "Gemma 4 (llama-server) needs setup before transcription can start.".into(),
+            parakeet_warming: false,
+            omni_asr_warming: false,
+            cohere_transcribe_warming: false,
+        };
+    }
+
+    SttStatusPayload {
+        selected_provider,
+        effective_provider: "whisper-rs".into(),
+        selected_model: whisper_model.clone(),
+        effective_model: whisper_model.clone(),
+        selected_provider_ready: whisper_ready,
+        ready: whisper_ready,
+        using_fallback: false,
+        download_required: !whisper_ready,
+        message: if whisper_ready {
+            format!("whisper-rs is ready with {}.", whisper_model)
+        } else {
+            "whisper-rs model is missing and needs download.".into()
+        },
+        parakeet_warming: false,
+        omni_asr_warming: false,
+        cohere_transcribe_warming: false,
+    }
+}
+
+fn resolve_stt_backend(
+    app: &AppHandle,
+    settings: &AppSettings,
+) -> Result<(SttBackend, String, SttStatusPayload), String> {
+    let status = resolve_stt_status(app, settings);
+
+    if !status.ready {
+        return Err(status.message.clone());
+    }
+
+    let language = resolve_transcription_language(settings, &status.effective_model);
+    let backend = if status.effective_provider == "faster-whisper" {
+        SttBackend::FasterWhisper(AppState::faster_whisper_config(settings))
+    } else if status.effective_provider == "parakeet" {
+        SttBackend::Parakeet(AppState::parakeet_config(settings))
+    } else if status.effective_provider == "omni-asr" {
+        SttBackend::OmniAsr(AppState::omni_asr_config(settings))
+    } else if status.effective_provider == "cohere-transcribe" {
+        SttBackend::CohereTranscribe(AppState::cohere_transcribe_config(settings))
+    } else if status.effective_provider == "llama-server" {
+        SttBackend::LlamaServer {
+            base_url: llama_server::base_url(settings.llama_server_port),
+        }
+    } else {
+        let model_path = AppState::whisper_model_path_for(app, &status.effective_model)?
+            .to_string_lossy()
+            .into_owned();
+        SttBackend::WhisperRs { model_path }
+    };
+
+    Ok((backend, language, status))
+}
+
+fn resolve_transcription_language(settings: &AppSettings, model: &str) -> String {
+    let locale = settings.transcription_locale.trim().to_ascii_lowercase();
+    if !locale.is_empty() && locale != "auto" {
+        return locale.split('-').next().unwrap_or("en").to_string();
+    }
+
+    if model.ends_with("-en") {
+        "en".into()
+    } else {
+        String::new()
+    }
+}
+
+/// Maps a Python worker speaker ID (e.g. "speaker_0") to a (participant_id, participant_label) pair.
+/// Falls back to ("remote_1", "Speaker A") for unrecognised formats.
+fn speaker_id_to_label(id: &str) -> (String, String) {
+    if let Some(n_str) = id.strip_prefix("speaker_") {
+        if let Ok(n) = n_str.parse::<usize>() {
+            return (id.to_string(), format!("Speaker {}", n + 1));
+        }
+    }
+    ("remote_1".to_string(), "Speaker A".to_string())
+}
+
+// ── LLM / Embed resolver helpers ─────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LlmRequestKind {
+    HealthCheck,
+    LiveSuggestion,
+    Notes,
+}
+
+impl LlmRequestKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HealthCheck => "health_check",
+            Self::LiveSuggestion => "live_suggestion",
+            Self::Notes => "notes",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HttpLlmConfig {
+    base_url: String,
+    api_key: Option<String>,
+    model: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResolvedLlmProvider {
+    Http(HttpLlmConfig),
+    CodexCli,
+}
+
+fn http_llm_config_for_provider(settings: &AppSettings, provider: &str) -> HttpLlmConfig {
+    match provider {
+        "llama-server" => (
+            llama_server::base_url(settings.llama_server_port),
+            None,
+            llama_server::MODEL_NAME.to_string(),
+        )
+            .into(),
+        "ollama" => (
+            format!("{}/v1", settings.ollama_base_url.trim_end_matches('/')),
+            None,
+            settings.ollama_llm_model.clone(),
+        )
+            .into(),
+        "openai" => (
+            normalize_openai_base_url(&settings.open_ai_llm_base_url),
+            keychain::KeyEntry::open_ai_llm_api_key().load(),
+            settings.selected_model.clone(),
+        )
+            .into(),
+        _ => {
+            let key = keychain::KeyEntry::open_router_api_key().load();
+            (
+                "https://openrouter.ai/api/v1".into(),
+                key,
+                settings.selected_model.clone(),
+            )
+                .into()
+        }
+    }
+}
+
+impl From<(String, Option<String>, String)> for HttpLlmConfig {
+    fn from(value: (String, Option<String>, String)) -> Self {
+        Self {
+            base_url: value.0,
+            api_key: value.1,
+            model: value.2,
+        }
+    }
+}
+
+fn resolve_llm_provider(settings: &AppSettings) -> ResolvedLlmProvider {
+    if settings.llm_provider == "codex-cli" {
+        ResolvedLlmProvider::CodexCli
+    } else {
+        ResolvedLlmProvider::Http(http_llm_config_for_provider(
+            settings,
+            &settings.llm_provider,
+        ))
+    }
+}
+
+fn codex_cli_config(settings: &AppSettings, request_kind: LlmRequestKind) -> CodexCliConfig {
+    let model = if settings.codex_cli_model.trim().is_empty() {
+        None
+    } else {
+        Some(settings.codex_cli_model.trim().to_string())
+    };
+    let command_path = if settings.codex_cli_path.trim().is_empty() {
+        "codex".to_string()
+    } else {
+        settings.codex_cli_path.trim().to_string()
+    };
+    let timeout = match request_kind {
+        LlmRequestKind::HealthCheck => Duration::from_secs(45),
+        LlmRequestKind::LiveSuggestion => Duration::from_secs(45),
+        LlmRequestKind::Notes => Duration::from_secs(120),
+    };
+    let obsidian_vault = settings
+        .obsidian_vault_pathbuf()
+        .filter(|path| path.is_dir());
+    let use_obsidian_search = request_kind == LlmRequestKind::LiveSuggestion
+        && settings.llm_provider == "codex-cli"
+        && obsidian_vault.is_some();
+    let working_dir = if use_obsidian_search {
+        obsidian_vault
+            .clone()
+            .unwrap_or_else(|| AppState::persistent_data_dir().join("codex-workspace"))
+    } else {
+        AppState::persistent_data_dir().join("codex-workspace")
+    };
+    CodexCliConfig {
+        command_path,
+        model,
+        working_dir,
+        output_dir: AppState::persistent_data_dir().join("codex-output"),
+        timeout,
+        allow_workspace_search: use_obsidian_search,
+    }
+}
+
+fn codex_obsidian_search_instruction(settings: &AppSettings) -> Option<String> {
+    if settings.llm_provider != "codex-cli" {
+        return None;
+    }
+    let vault = settings.obsidian_vault_pathbuf()?;
+    if !vault.is_dir() {
+        return None;
+    }
+
+    let include_paths = {
+        let mut paths = settings
+            .obsidian_kb_include_paths
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if !settings.obsidian_notes_folder.trim().is_empty()
+            && !paths
+                .iter()
+                .any(|path| path == settings.obsidian_notes_folder.trim())
+        {
+            paths.push(settings.obsidian_notes_folder.trim().to_string());
+        }
+        if paths.is_empty() {
+            "the whole vault".into()
+        } else {
+            paths.join(", ")
+        }
+    };
+    let transcripts_folder = if settings.obsidian_transcripts_folder.trim().is_empty() {
+        "the configured transcript folder".into()
+    } else {
+        settings.obsidian_transcripts_folder.trim().to_string()
+    };
+
+    Some(format!(
+        "Codex vault search: before deciding, search the Obsidian vault mounted as the current working directory for notes that could answer or contextualize the current conversation. Prefer these paths: {include_paths}. Ignore .obsidian and {transcripts_folder}. Use only read-only inspection. If no relevant note exists, return shouldSurface=false in the JSON gate."
+    ))
+}
+
+fn codex_fallback_provider(settings: &AppSettings) -> Option<&str> {
+    match settings.codex_cli_fallback_provider.trim() {
+        "openai" => Some("openai"),
+        "ollama" => Some("ollama"),
+        "openrouter" => Some("openrouter"),
+        _ => None,
+    }
+}
+
+fn messages_require_json_response(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        let content = message.content.to_ascii_lowercase();
+        content.contains("return json")
+            || content.contains("return only valid json")
+            || content.contains("return only json")
+    })
+}
+
+fn is_valid_json_response(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(strip_fences(text)).is_ok()
+}
+
+fn record_codex_usage(record: CodexUsageRecord) {
+    if let Some(parent) = codex_usage_ledger_path().parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            log::warn!("Failed to create Codex usage directory: {err}");
+            return;
+        }
+    }
+
+    let line = match serde_json::to_string(&record) {
+        Ok(line) => line,
+        Err(err) => {
+            log::warn!("Failed to serialize Codex usage record: {err}");
+            return;
+        }
+    };
+
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(codex_usage_ledger_path())
+    {
+        Ok(mut file) => {
+            if let Err(err) = writeln!(file, "{line}") {
+                log::warn!("Failed to write Codex usage record: {err}");
+            }
+        }
+        Err(err) => log::warn!("Failed to open Codex usage ledger: {err}"),
+    }
+}
+
+fn codex_usage_record(
+    request_kind: LlmRequestKind,
+    model: Option<String>,
+    success: bool,
+    outcome: impl Into<String>,
+    fallback_provider: Option<String>,
+    duration_ms: u128,
+    usage: Option<CodexTokenUsage>,
+    error: Option<String>,
+) -> CodexUsageRecord {
+    CodexUsageRecord {
+        id: Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        request_kind: request_kind.as_str().into(),
+        model,
+        success,
+        outcome: outcome.into(),
+        fallback_provider,
+        duration_ms,
+        input_tokens: usage.as_ref().and_then(|u| u.input_tokens),
+        cached_input_tokens: usage.as_ref().and_then(|u| u.cached_input_tokens),
+        output_tokens: usage.as_ref().and_then(|u| u.output_tokens),
+        total_tokens: usage.as_ref().and_then(|u| u.total_tokens),
+        // Codex CLI usage here is backed by the user's ChatGPT/Codex login. ContextCall
+        // tracks calls and tokens, but does not infer a metered API bill from a subscription.
+        estimated_metered_cost_usd: None,
+        error,
+    }
+}
+
+async fn complete_with_http_provider(
+    config: HttpLlmConfig,
+    messages: Vec<Message>,
+    max_tokens: u32,
+) -> Result<String, String> {
+    contextcall_core::intelligence::llm_client::complete(
+        &config.base_url,
+        config.api_key.as_deref(),
+        &config.model,
+        messages,
+        max_tokens,
+    )
+    .await
+}
+
+/// Resolve the llama-server config from settings, erroring when assets are missing.
+fn llama_server_config(settings: &AppSettings) -> Result<llama_server::LlamaServerConfig, String> {
+    llama_server::assets_status()
+        .into_config(settings.llama_server_port)
+        .ok_or_else(|| {
+            "Gemma 4 (llama-server) needs setup. Open Settings → AI Providers to download it."
+                .to_string()
+        })
+}
+
+/// Boot the managed llama-server before any HTTP call that targets it.
+/// No-op for every other provider.
+async fn ensure_llama_for_provider(settings: &AppSettings, provider: &str) -> Result<(), String> {
+    if provider != "llama-server" {
+        return Ok(());
+    }
+    llama_server::ensure_running(llama_server_config(settings)?).await
+}
+
+async fn complete_with_settings(
+    settings: &AppSettings,
+    messages: Vec<Message>,
+    max_tokens: u32,
+    request_kind: LlmRequestKind,
+) -> Result<String, String> {
+    ensure_llama_for_provider(settings, &settings.llm_provider).await?;
+    match resolve_llm_provider(settings) {
+        ResolvedLlmProvider::Http(config) => {
+            let result = complete_with_http_provider(config, messages, max_tokens).await;
+            if settings.llm_provider == "llama-server" {
+                // Gemma 4 can leak channel control tokens into content.
+                result.map(|text| llama_server::sanitize_output(&text))
+            } else {
+                result
+            }
+        }
+        ResolvedLlmProvider::CodexCli => {
+            let config = codex_cli_config(settings, request_kind);
+            let started = Instant::now();
+            let model = config.model.clone();
+            match codex_client::complete(&config, &messages).await {
+                Ok(completion) => {
+                    if messages_require_json_response(&messages)
+                        && !is_valid_json_response(&completion.text)
+                    {
+                        if let Some(provider) = codex_fallback_provider(settings) {
+                            log::warn!(
+                                "Codex CLI returned unusable JSON for {:?}; falling back to {}",
+                                request_kind,
+                                provider
+                            );
+                            record_codex_usage(codex_usage_record(
+                                request_kind,
+                                model,
+                                true,
+                                "fallback_after_unusable_json",
+                                Some(provider.to_string()),
+                                started.elapsed().as_millis(),
+                                completion.usage,
+                                Some("Codex CLI returned unusable JSON".into()),
+                            ));
+                            complete_with_http_provider(
+                                http_llm_config_for_provider(settings, provider),
+                                messages,
+                                max_tokens,
+                            )
+                            .await
+                        } else {
+                            record_codex_usage(codex_usage_record(
+                                request_kind,
+                                model,
+                                true,
+                                "unusable_json",
+                                None,
+                                started.elapsed().as_millis(),
+                                completion.usage,
+                                Some("Codex CLI returned unusable JSON".into()),
+                            ));
+                            Ok(completion.text)
+                        }
+                    } else {
+                        record_codex_usage(codex_usage_record(
+                            request_kind,
+                            model,
+                            true,
+                            "success",
+                            None,
+                            started.elapsed().as_millis(),
+                            completion.usage,
+                            None,
+                        ));
+                        Ok(completion.text)
+                    }
+                }
+                Err(err) => {
+                    if let Some(provider) = codex_fallback_provider(settings) {
+                        log::warn!(
+                            "Codex CLI failed for {:?}; falling back to {}: {}",
+                            request_kind,
+                            provider,
+                            err
+                        );
+                        record_codex_usage(codex_usage_record(
+                            request_kind,
+                            model,
+                            true,
+                            "fallback_after_error",
+                            Some(provider.to_string()),
+                            started.elapsed().as_millis(),
+                            None,
+                            Some(err.clone()),
+                        ));
+                        complete_with_http_provider(
+                            http_llm_config_for_provider(settings, provider),
+                            messages,
+                            max_tokens,
+                        )
+                        .await
+                    } else {
+                        record_codex_usage(codex_usage_record(
+                            request_kind,
+                            model,
+                            false,
+                            "error",
+                            None,
+                            started.elapsed().as_millis(),
+                            None,
+                            Some(err.clone()),
+                        ));
+                        Err(format!(
+                            "{err}. Check that Codex CLI is installed and signed in with `codex login`, or configure an explicit fallback provider."
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn embed_config(settings: &AppSettings) -> (String, Option<String>, String) {
+    match settings.embedding_provider.as_str() {
+        "ollama" => (
+            format!("{}/v1", settings.ollama_base_url.trim_end_matches('/')),
+            None,
+            settings.ollama_embed_model.clone(),
+        ),
+        "openai" => {
+            let key = keychain::KeyEntry::open_ai_embed_api_key().load();
+            (
+                normalize_openai_base_url(&settings.open_ai_embed_base_url),
+                key,
+                settings.open_ai_embed_model.clone(),
+            )
+        }
+        _ => {
+            let key = keychain::KeyEntry::voyage_api_key().load();
+            (
+                "https://api.voyageai.com/v1".into(),
+                key,
+                "voyage-3-lite".into(),
+            )
+        }
+    }
+}
+
+struct KnowledgeBaseContext {
+    cache_path: PathBuf,
+    config_fingerprint: String,
+    root_marker: String,
+}
+
+struct ResolvedKbIndexConfig {
+    root: PathBuf,
+    include_paths: Vec<PathBuf>,
+    exclude_relative_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SettingsChangeSet {
+    kb_config_changed: bool,
+    stt_config_changed: bool,
+    push_to_talk_changed: bool,
+    content_protection_changed: bool,
+}
+
+impl SettingsChangeSet {
+    fn between(previous: &AppSettings, next: &AppSettings) -> Self {
+        let ollama_embedding_config_changed = (previous.embedding_provider == "ollama"
+            || next.embedding_provider == "ollama")
+            && (previous.ollama_base_url != next.ollama_base_url
+                || previous.ollama_embed_model != next.ollama_embed_model);
+        let openai_embedding_config_changed = (previous.embedding_provider == "openai"
+            || next.embedding_provider == "openai")
+            && (previous.open_ai_embed_base_url != next.open_ai_embed_base_url
+                || previous.open_ai_embed_model != next.open_ai_embed_model);
+        let kb_config_changed = previous.kb_folder_path != next.kb_folder_path
+            || previous.obsidian_vault_path != next.obsidian_vault_path
+            || previous.obsidian_kb_include_paths != next.obsidian_kb_include_paths
+            || previous.obsidian_notes_folder != next.obsidian_notes_folder
+            || previous.embedding_provider != next.embedding_provider
+            || ollama_embedding_config_changed
+            || openai_embedding_config_changed;
+
+        let stt_config_changed = previous.stt_provider != next.stt_provider
+            || previous.transcription_locale != next.transcription_locale
+            || previous.whisper_model != next.whisper_model
+            || previous.faster_whisper_model != next.faster_whisper_model
+            || previous.faster_whisper_compute_type != next.faster_whisper_compute_type
+            || previous.faster_whisper_device != next.faster_whisper_device
+            || previous.parakeet_model != next.parakeet_model
+            || previous.parakeet_device != next.parakeet_device
+            || previous.omni_asr_model != next.omni_asr_model
+            || previous.omni_asr_device != next.omni_asr_device
+            || previous.cohere_transcribe_model != next.cohere_transcribe_model
+            || previous.cohere_transcribe_device != next.cohere_transcribe_device
+            || previous.diarization_enabled != next.diarization_enabled
+            || previous.echo_cancellation_enabled != next.echo_cancellation_enabled
+            || previous.llama_server_port != next.llama_server_port;
+
+        let push_to_talk_changed = previous.mic_capture_mode != next.mic_capture_mode
+            || previous.push_to_talk_hotkey != next.push_to_talk_hotkey;
+
+        let content_protection_changed =
+            previous.hide_from_screen_share != next.hide_from_screen_share;
+
+        Self {
+            kb_config_changed,
+            stt_config_changed,
+            push_to_talk_changed,
+            content_protection_changed,
+        }
+    }
+}
+
+fn knowledge_base_context(settings: &AppSettings, cache_path: PathBuf) -> KnowledgeBaseContext {
+    let (embed_url, _, embed_model) = embed_config(settings);
+    let root_marker = resolved_kb_index_config(settings)
+        .map(|config| config.root.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    KnowledgeBaseContext {
+        cache_path,
+        config_fingerprint: format!("{embed_url}:{embed_model}"),
+        root_marker,
+    }
+}
+
+fn configured_obsidian(settings: &AppSettings) -> Option<ObsidianVaultConfig> {
+    let vault_path = settings.obsidian_vault_pathbuf()?;
+    Some(ObsidianVaultConfig::new(
+        vault_path,
+        &settings.obsidian_notes_folder,
+        &settings.obsidian_transcripts_folder,
+    ))
+}
+
+fn resolved_kb_index_config(settings: &AppSettings) -> Option<ResolvedKbIndexConfig> {
+    if let Some(obsidian) = configured_obsidian(settings) {
+        let mut seen = HashSet::new();
+        let mut include_paths = Vec::new();
+
+        for relative_path in &settings.obsidian_kb_include_paths {
+            let normalized = normalize_relative_folder(relative_path);
+            let normalized_key = normalized.to_string_lossy().replace('\\', "/");
+            if normalized_key.is_empty() || !seen.insert(normalized_key) {
+                continue;
+            }
+            include_paths.push(normalized);
+        }
+
+        let notes_folder_key = obsidian.notes_folder.to_string_lossy().replace('\\', "/");
+        if !notes_folder_key.is_empty() && seen.insert(notes_folder_key) {
+            include_paths.push(obsidian.notes_folder.clone());
+        }
+
+        let mut exclude_relative_paths = vec![PathBuf::from(".obsidian")];
+        if !obsidian.transcripts_folder.as_os_str().is_empty() {
+            exclude_relative_paths.push(obsidian.transcripts_folder.clone());
+        }
+
+        return Some(ResolvedKbIndexConfig {
+            root: obsidian.vault_path,
+            include_paths,
+            exclude_relative_paths,
+        });
+    }
+
+    settings
+        .kb_folder_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|root| ResolvedKbIndexConfig {
+            root: root.clone(),
+            include_paths: vec![root],
+            exclude_relative_paths: Vec::new(),
+        })
+}
+
+fn reinitialize_knowledge_base(state: &Arc<AppState>, settings: &AppSettings) {
+    let cache_path = AppState::persistent_data_dir().join("kb_cache.json");
+    let context = knowledge_base_context(settings, cache_path);
+    let knowledge_base = KnowledgeBase::new(
+        context.cache_path,
+        context.config_fingerprint,
+        context.root_marker,
+    );
+    let snapshot = Arc::new(knowledge_base.chunks.clone());
+    *state.knowledge_base.blocking_lock() = knowledge_base;
+    *state.kb_search_snapshot.blocking_write() = snapshot;
+}
+
+async fn sync_knowledge_base(
+    app: Option<&AppHandle>,
+    state: &Arc<AppState>,
+    settings: &AppSettings,
+) -> Result<usize, String> {
+    let Some(config) = resolved_kb_index_config(settings) else {
+        return Err("No knowledge base source configured".into());
+    };
+
+    let (embed_url, embed_key, embed_model) = embed_config(settings);
+    let embed_fn = {
+        let url = embed_url.clone();
+        let key = embed_key.clone();
+        let model = embed_model.clone();
+        move |texts: Vec<String>| {
+            let url = url.clone();
+            let key = key.clone();
+            let model = model.clone();
+            async move {
+                embedding_client::embed(&url, key.as_deref(), &model, &texts, None, None).await
+            }
+        }
+    };
+
+    let (count, snapshot) = {
+        let mut kb = state.knowledge_base.lock().await;
+        let count = kb
+            .index_with_paths(
+                &config.root,
+                &config.include_paths,
+                &config.exclude_relative_paths,
+                embed_fn,
+            )
+            .await?;
+        (count, Arc::new(kb.chunks.clone()))
+    };
+    *state.kb_search_snapshot.write().await = snapshot;
+
+    if let Some(app) = app {
+        app.emit("kb-indexed", count).ok();
+    }
+
+    Ok(count)
+}
+
+fn parse_session_started_at(session_id: &str) -> chrono::DateTime<chrono::Utc> {
+    let date_part = session_id.trim_start_matches("session_");
+    chrono::NaiveDateTime::parse_from_str(date_part, "%Y-%m-%d_%H-%M-%S")
+        .map(|dt| dt.and_utc())
+        .unwrap_or_else(|_| chrono::Utc::now())
+}
+
+fn default_template_id(settings: &AppSettings) -> Uuid {
+    settings
+        .default_notes_template_id
+        .unwrap_or_else(|| Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap())
+}
+
+fn normalize_openai_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.into()
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
+pub(crate) fn top_percentile_mean(values: &[f32], percentile: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let count = ((values.len() as f32 * percentile).ceil() as usize).max(1);
+    let top = &sorted[..count.min(sorted.len())];
+    top.iter().sum::<f32>() / top.len() as f32
+}
+
+fn compute_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mean_sq = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
+    mean_sq.sqrt().min(1.0)
+}
+
+fn push_recent_utterance(
+    buffer: &Arc<Mutex<Vec<contextcall_core::models::Utterance>>>,
+    utterance: contextcall_core::models::Utterance,
+    retention_window_secs: i64,
+) {
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(retention_window_secs);
+    let mut entries = buffer.lock().unwrap();
+    entries.push(utterance);
+    entries.retain(|entry| entry.timestamp >= cutoff);
+}
+
+/// Normalize text for echo comparison: lowercase, split on non-alphanumeric, rejoin with spaces.
+fn normalize_for_echo(text: &str) -> String {
+    let lower = text.to_lowercase();
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// Returns true if any sliding window of `n` consecutive words from `them_words`
+/// appears verbatim as a substring in `mic_text`.
+fn has_shared_ngram(them_words: &[&str], mic_text: &str, n: usize) -> bool {
+    them_words
+        .windows(n)
+        .any(|w| mic_text.contains(&w.join(" ")))
+}
+
+/// Jaccard similarity over word sets of two normalized strings.
+fn jaccard_word_similarity(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    let set_a: HashSet<&str> = a.split_whitespace().collect();
+    let set_b: HashSet<&str> = b.split_whitespace().collect();
+    if set_a.is_empty() && set_b.is_empty() {
+        return 1.0;
+    }
+    let intersection = set_a.intersection(&set_b).count();
+    let union_size = set_a.union(&set_b).count();
+    intersection as f64 / union_size as f64
+}
+
+/// Returns true if `mic_text` is likely an acoustic echo of a recent Them utterance.
+/// Uses text-level Jaccard similarity and substring containment, mirroring the approach
+/// from yazinsai/OpenOats AcousticEchoFilter.
+fn is_text_echo(
+    mic_text: &str,
+    recent: &Arc<Mutex<Vec<contextcall_core::models::Utterance>>>,
+    window_secs: i64,
+) -> bool {
+    const SIMILARITY_THRESHOLD: f64 = 0.45;
+    const MIN_WORD_COUNT: usize = 4;
+    const MIN_CHAR_COUNT: usize = 20;
+
+    let normalized_mic = normalize_for_echo(mic_text);
+    let word_count = normalized_mic.split_whitespace().count();
+    if word_count < MIN_WORD_COUNT && normalized_mic.len() < MIN_CHAR_COUNT {
+        return false;
+    }
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(window_secs);
+    let utterances = recent.lock().unwrap();
+    for utterance in utterances.iter().rev() {
+        if utterance.timestamp < cutoff {
+            break;
+        }
+        if !matches!(utterance.speaker, Speaker::Them) {
+            continue;
+        }
+        let normalized_them = normalize_for_echo(&utterance.text);
+        let them_word_count = normalized_them.split_whitespace().count();
+        if them_word_count < MIN_WORD_COUNT && normalized_them.len() < MIN_CHAR_COUNT {
+            continue;
+        }
+        let sim = jaccard_word_similarity(&normalized_mic, &normalized_them);
+        let contains = normalized_mic.contains(normalized_them.as_str())
+            || normalized_them.contains(normalized_mic.as_str());
+        let them_words: Vec<&str> = normalized_them.split_whitespace().collect();
+        let has_ngram = has_shared_ngram(&them_words, &normalized_mic, 3)
+            || (word_count <= 5 && has_shared_ngram(&them_words, &normalized_mic, 2));
+        if sim >= SIMILARITY_THRESHOLD || contains || has_ngram {
+            log::info!(
+                "[echo-filter] suppressed mic as echo sim={:.2} ngram={} mic='{}' them='{}'",
+                sim,
+                has_ngram,
+                &mic_text[..mic_text.len().min(80)],
+                &utterance.text[..utterance.text.len().min(80)]
+            );
+            return true;
+        }
+    }
+    false
+}
+
+fn emit_transcription_progress(app: &AppHandle, state: &AppState) {
+    app.emit(
+        "transcription-progress",
+        &TranscriptionProgressPayload {
+            captured_segments: state.captured_segments.load(Ordering::Relaxed),
+            processed_segments: state.processed_segments.load(Ordering::Relaxed),
+        },
+    )
+    .ok();
+}
+
+// ── Tauri commands ───────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn check_model(app: AppHandle, model: String) -> Result<bool, String> {
+    let path = AppState::whisper_model_path_for(&app, &model)?;
+    Ok(download::model_exists(&path))
+}
+
+#[tauri::command]
+pub fn get_model_path(app: AppHandle, model: String) -> Result<String, String> {
+    AppState::whisper_model_path_for(&app, &model).map(|p| p.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn get_stt_status(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<SttStatusPayload, String> {
+    let settings = state.settings.lock().unwrap().clone();
+    let mut status = resolve_stt_status(&app, &settings);
+    status.parakeet_warming = state.parakeet_warming.load(Ordering::Relaxed);
+    status.omni_asr_warming = state.omni_asr_warming.load(Ordering::Relaxed);
+    status.cohere_transcribe_warming = state.cohere_transcribe_warming.load(Ordering::Relaxed);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn check_codex_cli(path: String) -> Result<String, String> {
+    let command_path = codex_client::resolve_command_path(&path)?;
+    let mut version_command = Command::new(&command_path);
+    version_command.arg("--version");
+    if let Some(path) = codex_client::process_path_env(&command_path) {
+        version_command.env("PATH", path);
+    }
+
+    let output = version_command.output()
+        .map_err(|e| {
+            format!(
+                "Could not run `{command_path} --version`: {e}. Install Codex CLI and sign in with `codex login`."
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "`{command_path} --version` failed. {}",
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout.trim();
+    let version_message = if version.is_empty() {
+        format!("{command_path} is available.")
+    } else {
+        version.to_string()
+    };
+
+    let config = CodexCliConfig {
+        command_path,
+        model: None,
+        working_dir: AppState::persistent_data_dir().join("codex-health-check"),
+        output_dir: AppState::persistent_data_dir().join("codex-output"),
+        timeout: Duration::from_secs(45),
+        allow_workspace_search: false,
+    };
+    let started = Instant::now();
+    let result = codex_client::complete(&config, &[Message::user("Reply with exactly: OK")]).await;
+
+    match result {
+        Ok(completion) => {
+            let normalized = completion.text.trim();
+            let success = normalized == "OK";
+            record_codex_usage(codex_usage_record(
+                LlmRequestKind::HealthCheck,
+                None,
+                success,
+                if success {
+                    "health_check_success"
+                } else {
+                    "health_check_unexpected_response"
+                },
+                None,
+                started.elapsed().as_millis(),
+                completion.usage,
+                (!success).then(|| format!("Expected OK, got `{normalized}`")),
+            ));
+
+            if success {
+                Ok(format!("{version_message}. Smoke test passed."))
+            } else {
+                Err(format!(
+                    "{version_message}, but Codex smoke test returned `{normalized}` instead of `OK`."
+                ))
+            }
+        }
+        Err(err) => {
+            record_codex_usage(codex_usage_record(
+                LlmRequestKind::HealthCheck,
+                None,
+                false,
+                "health_check_error",
+                None,
+                started.elapsed().as_millis(),
+                None,
+                Some(err.clone()),
+            ));
+            Err(format!(
+                "{version_message}, but Codex smoke test failed: {err}"
+            ))
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_codex_usage_summary() -> Result<CodexUsageSummary, String> {
+    let path = codex_usage_ledger_path();
+    let mut summary = CodexUsageSummary {
+        estimated_metered_cost_usd: None,
+        billing_note:
+            "Codex CLI is authenticated through your ChatGPT/Codex login; ContextCall tracks calls and tokens, not a separate metered API bill."
+                .into(),
+        ledger_path: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+
+    let data = match std::fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(summary),
+        Err(err) => return Err(format!("Failed to read Codex usage ledger: {err}")),
+    };
+
+    for line in data.lines().filter(|line| !line.trim().is_empty()) {
+        let record = match serde_json::from_str::<CodexUsageRecord>(line) {
+            Ok(record) => record,
+            Err(err) => {
+                log::warn!("Skipping malformed Codex usage ledger line: {err}");
+                continue;
+            }
+        };
+        summary.total_requests += 1;
+        if record.success {
+            summary.successful_requests += 1;
+        } else {
+            summary.failed_requests += 1;
+        }
+        if record.fallback_provider.is_some() {
+            summary.fallback_requests += 1;
+        }
+
+        let known_tokens = record.input_tokens.is_some()
+            || record.cached_input_tokens.is_some()
+            || record.output_tokens.is_some()
+            || record.total_tokens.is_some();
+        if !known_tokens {
+            summary.unknown_token_requests += 1;
+        }
+
+        summary.input_tokens += record.input_tokens.unwrap_or(0);
+        summary.cached_input_tokens += record.cached_input_tokens.unwrap_or(0);
+        summary.output_tokens += record.output_tokens.unwrap_or(0);
+        summary.total_tokens += record.total_tokens.unwrap_or_else(|| {
+            record.input_tokens.unwrap_or(0) + record.output_tokens.unwrap_or(0)
+        });
+    }
+
+    Ok(summary)
+}
+
+#[tauri::command]
+pub fn get_settings(state: tauri::State<'_, Arc<AppState>>) -> AppSettings {
+    state.settings.lock().unwrap().clone()
+}
+
+#[derive(serde::Serialize)]
+pub struct DefaultSuggestionPrompts {
+    pub kb_surfacing_system_prompt: String,
+    pub suggestion_synthesis_system_prompt: String,
+    pub smart_question_system_prompt: String,
+}
+
+#[tauri::command]
+pub fn get_default_suggestion_prompts() -> DefaultSuggestionPrompts {
+    let defaults = AppSettings::default();
+    DefaultSuggestionPrompts {
+        kb_surfacing_system_prompt: defaults.kb_surfacing_system_prompt,
+        suggestion_synthesis_system_prompt: defaults.suggestion_synthesis_system_prompt,
+        smart_question_system_prompt: defaults.smart_question_system_prompt,
+    }
+}
+
+#[tauri::command]
+pub fn get_api_keys() -> ApiKeysPayload {
+    let settings = AppSettings::load();
+    ApiKeysPayload {
+        open_router_api_key: keychain::KeyEntry::open_router_api_key()
+            .load()
+            .unwrap_or_default(),
+        voyage_api_key: keychain::KeyEntry::voyage_api_key()
+            .load()
+            .unwrap_or_default(),
+        open_ai_llm_api_key: keychain::KeyEntry::open_ai_llm_api_key()
+            .load()
+            .unwrap_or_default(),
+        open_ai_embed_api_key: keychain::KeyEntry::open_ai_embed_api_key()
+            .load()
+            .unwrap_or_default(),
+        hugging_face_token: keychain::KeyEntry::hugging_face_token()
+            .load()
+            .or_else(|| settings.hugging_face_token)
+            .unwrap_or_default(),
+    }
+}
+
+#[tauri::command]
+pub fn save_api_keys(
+    new_keys: ApiKeysPayload,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    keychain::KeyEntry::open_router_api_key()
+        .save_or_delete(&new_keys.open_router_api_key)
+        .map_err(|e| e.to_string())?;
+    keychain::KeyEntry::voyage_api_key()
+        .save_or_delete(&new_keys.voyage_api_key)
+        .map_err(|e| e.to_string())?;
+    keychain::KeyEntry::open_ai_llm_api_key()
+        .save_or_delete(&new_keys.open_ai_llm_api_key)
+        .map_err(|e| e.to_string())?;
+    keychain::KeyEntry::open_ai_embed_api_key()
+        .save_or_delete(&new_keys.open_ai_embed_api_key)
+        .map_err(|e| e.to_string())?;
+    keychain::KeyEntry::hugging_face_token()
+        .save_or_delete(&new_keys.hugging_face_token)
+        .map_err(|e| e.to_string())?;
+    let mut settings = AppSettings::load();
+    settings.hugging_face_token = if new_keys.hugging_face_token.trim().is_empty() {
+        None
+    } else {
+        Some(new_keys.hugging_face_token.clone())
+    };
+    settings.save();
+    state.settings.lock().unwrap().hugging_face_token = settings.hugging_face_token.clone();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn save_settings(
+    new_settings: AppSettings,
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let previous_settings = state.settings.lock().unwrap().clone();
+    let changes = SettingsChangeSet::between(&previous_settings, &new_settings);
+
+    if new_settings.mic_capture_mode == MicCaptureMode::PushToTalk {
+        push_to_talk_shortcut_for_plugin(&new_settings.push_to_talk_hotkey)?;
+    }
+    let is_running = *state.is_running.lock().unwrap();
+    if changes.push_to_talk_changed {
+        sync_push_to_talk_shortcut_registration(&app, &state, &new_settings, is_running)?;
+    }
+
+    let mut s = state.settings.lock().unwrap();
+    *s = new_settings.clone();
+    state
+        .mic_gate_threshold
+        .store(mic_gate_threshold(&s).to_bits(), Ordering::Relaxed);
+    reset_mic_transmit_sources(&state, &s);
+    s.save();
+    let hide_from_screen_share = s.hide_from_screen_share;
+    drop(s);
+
+    if changes.kb_config_changed {
+        reinitialize_knowledge_base(&state, &new_settings);
+    }
+
+    if changes.stt_config_changed {
+        // Drop any pre-warmed workers so they don't carry stale config
+        // (e.g. old language) into the next recording session.
+        clear_warmed_workers(&state);
+    }
+
+    if changes.content_protection_changed {
+        set_content_protection(app, hide_from_screen_share)?;
+    }
+
+    // Pre-start llama-server in the background when the user just switched to it
+    // (assets permitting), so the first suggestion/recording is not delayed by
+    // model load; stop it to free VRAM when it is no longer selected anywhere.
+    // Config changes (e.g. port) restart it lazily on next use.
+    let llama_used_now = new_settings.llm_provider == "llama-server"
+        || selected_stt_provider(&new_settings) == "llama-server";
+    let llama_used_before = previous_settings.llm_provider == "llama-server"
+        || selected_stt_provider(&previous_settings) == "llama-server";
+    if llama_used_now && !llama_used_before {
+        if let Ok(config) = llama_server_config(&new_settings) {
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = llama_server::ensure_running(config).await {
+                    log::warn!("[llama-server] warmup after settings change failed: {e}");
+                }
+            });
+        }
+    } else if llama_used_before && !llama_used_now {
+        tauri::async_runtime::spawn(async {
+            llama_server::stop().await;
+        });
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_mic_transmit_active(
+    active: bool,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let settings = state.settings.lock().unwrap().clone();
+    state
+        .mic_transmit_button_active
+        .store(active, Ordering::Relaxed);
+    refresh_mic_transmit_active(&state, &settings);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_mic_devices() -> Vec<String> {
+    CpalMicCapture::available_device_names()
+}
+
+#[tauri::command]
+pub fn list_sys_audio_devices() -> Vec<String> {
+    crate::audio_windows::list_render_devices()
+}
+
+#[tauri::command]
+pub fn start_transcription(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    save_recording: bool,
+) -> Result<String, String> {
+    let settings = state.settings.lock().unwrap().clone();
+
+    // Prevent starting a Parakeet session while the primary warmup worker is still loading.
+    // Once the first worker is ready we allow recording to start and warm the second worker
+    // in the background.
+    if selected_stt_provider(&settings) == "parakeet"
+        && state.parakeet_warming.load(Ordering::Relaxed)
+    {
+        return Err(
+            "Parakeet engine is still loading — please wait a moment and try again.".into(),
+        );
+    }
+    if selected_stt_provider(&settings) == "omni-asr"
+        && state.omni_asr_warming.load(Ordering::Relaxed)
+    {
+        return Err("OmniASR engine is still loading — please wait a moment and try again.".into());
+    }
+
+    if selected_stt_provider(&settings) == "cohere-transcribe"
+        && state.cohere_transcribe_warming.load(Ordering::Relaxed)
+    {
+        return Err(
+            "Cohere Transcribe engine is still loading â€” please wait a moment and try again."
+                .into(),
+        );
+    }
+
+    let (backend, language, stt_status) = resolve_stt_backend(&app, &settings)?;
+
+    // Boot the llama-server in the background; the transcriber's worker thread
+    // waits for /health, buffering early VAD segments instead of dropping them.
+    if matches!(&backend, SttBackend::LlamaServer { .. }) {
+        let config = llama_server_config(&settings)?;
+        let app_for_error = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = llama_server::ensure_running(config).await {
+                log::error!("[llama-server] startup failed: {e}");
+                // Surface the failure; otherwise the session records silence.
+                app_for_error
+                    .emit(
+                        "stt-setup-status",
+                        &SttSetupStatusPayload {
+                            stage: "error".into(),
+                            message: format!("Gemma 4 (llama-server) failed to start: {e}"),
+                        },
+                    )
+                    .ok();
+            }
+        });
+    }
+
+    let mut running = state.is_running.lock().unwrap();
+    if *running {
+        let session_id = state
+            .session_store
+            .lock()
+            .unwrap()
+            .current_session_id()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                "Transcription is already running, but no active session ID was found.".to_string()
+            })?;
+        return Ok(session_id);
+    }
+    *running = true;
+    state
+        .stop_requested
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    reset_mic_transmit_sources(&state, &settings);
+    state.captured_segments.store(0, Ordering::Relaxed);
+    state.processed_segments.store(0, Ordering::Relaxed);
+    drop(running);
+
+    if let Err(error) = sync_push_to_talk_shortcut_registration(&app, &state, &settings, true) {
+        *state.is_running.lock().unwrap() = false;
+        return Err(error);
+    }
+
+    let parakeet_config = match &backend {
+        SttBackend::Parakeet(config) => Some(config.clone()),
+        _ => None,
+    };
+    let warmed_mic = parakeet_config
+        .as_ref()
+        .and_then(|config| take_cached_parakeet_worker(&state, ParakeetWorkerSlot::Mic, config));
+    let warmed_sys = parakeet_config
+        .as_ref()
+        .and_then(|config| take_cached_parakeet_worker(&state, ParakeetWorkerSlot::Sys, config));
+    let warmed_omni_mic = state.warmed_omni_asr_mic.lock().unwrap().take();
+    let warmed_omni_sys = state.warmed_omni_asr_sys.lock().unwrap().take();
+    let warmed_cohere_mic = state.warmed_cohere_transcribe_mic.lock().unwrap().take();
+    let warmed_cohere_sys = state.warmed_cohere_transcribe_sys.lock().unwrap().take();
+
+    let session_id = {
+        let mut session_store = state.session_store.lock().unwrap();
+        session_store.start_session();
+        session_store
+            .current_session_id()
+            .map(str::to_owned)
+            .ok_or_else(|| "Failed to create a recording session.".to_string())?
+    };
+    state.transcript_logger.lock().unwrap().start_session();
+
+    state.suggestion_engine.blocking_lock().clear();
+    *state.overlay_suggestion.lock().unwrap() = None;
+    if let Some(overlay) = app.get_webview_window(OVERLAY_LABEL) {
+        let _ = overlay.hide();
+    }
+
+    let app_clone = app.clone();
+    let state_clone = Arc::clone(&state);
+
+    let device_name = settings.input_device_name.clone();
+    let sys_device_name = settings.system_audio_device_name.clone();
+    let suggestion_interval_secs = settings.suggestion_interval_seconds.max(30);
+    let suggestion_context_window_secs =
+        (suggestion_interval_secs.saturating_mul(2).min(180)) as i64;
+    let parakeet_config_for_them = parakeet_config.clone();
+    let parakeet_config_for_you = parakeet_config.clone();
+
+    let recent_utterances: Arc<Mutex<Vec<contextcall_core::models::Utterance>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let echo_reference = EchoReferenceBuffer::default();
+
+    // Start audio recorder after all early-return points so no orphan is left on failure.
+    if save_recording {
+        match AudioRecorder::new(&session_id) {
+            Ok(rec) => *state.audio_recorder.lock().unwrap() = Some(std::sync::Arc::new(rec)),
+            Err(e) => log::warn!("AudioRecorder::new failed, recording disabled: {e}"),
+        }
+    }
+
+    let handle = tauri::async_runtime::spawn(async move {
+        // Audio level polling task — runs until is_running goes false
+        let app_lvl = app_clone.clone();
+        let mil = Arc::clone(&state_clone.mic_input_level);
+        let ml = Arc::clone(&state_clone.mic_level);
+        let sl = Arc::clone(&state_clone.sys_level);
+        let mta = Arc::clone(&state_clone.mic_transmit_active);
+        let running_flag = Arc::clone(&state_clone);
+        let poll_handle = tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                if !*running_flag.is_running.lock().unwrap() {
+                    break;
+                }
+                let mic_input = f32::from_bits(mil.load(Ordering::Relaxed));
+                let mic_post_gate = f32::from_bits(ml.load(Ordering::Relaxed));
+                let them = f32::from_bits(sl.load(Ordering::Relaxed));
+                let mic_transmit_active = mta.load(Ordering::Relaxed);
+                app_lvl
+                    .emit(
+                        "audio-level",
+                        &AudioLevelPayload {
+                            mic_input,
+                            mic_post_gate,
+                            them,
+                            mic_transmit_active,
+                        },
+                    )
+                    .ok();
+            }
+        });
+        *state_clone.poll_task.lock().unwrap() = Some(poll_handle);
+
+        // ── "Them" system audio (WASAPI loopback) ──────────────────────────
+        let them_app = app_clone.clone();
+        let them_state = Arc::clone(&state_clone);
+        let them_backend = backend.clone();
+        let them_lang = language.clone();
+        let recent_utterances_spawn = Arc::clone(&recent_utterances);
+        let echo_reference_for_them = echo_reference.clone();
+
+        let them_recorder = state_clone.audio_recorder.lock().unwrap().clone();
+        let them_handle = tauri::async_runtime::spawn(async move {
+            let sys = SystemAudioCapture::new(sys_device_name.as_deref())
+                .with_stop_signal(Arc::clone(&them_state.stop_requested));
+            let them_stream = match sys.buffer_stream().await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("System audio capture unavailable: {e}");
+                    return;
+                }
+            };
+            use futures::StreamExt;
+            let sys_level_w = Arc::clone(&them_state.sys_level);
+            let echo_reference = echo_reference_for_them.clone();
+            let them_stream_leveled = them_stream.map(move |chunk: Vec<f32>| {
+                let rms = compute_rms(&chunk);
+                sys_level_w.store(rms.to_bits(), Ordering::Relaxed);
+                echo_reference.push_render_chunk(&chunk);
+                if let Some(ref rec) = them_recorder {
+                    rec.append_sys(&chunk);
+                }
+                chunk
+            });
+
+            let recent_utterances_clone = Arc::clone(&recent_utterances_spawn);
+            let app_sg = them_app.clone();
+            let state_sg = Arc::clone(&them_state);
+
+            let on_them = move |text: String, speaker_id: Option<String>| {
+                if !*state_sg.is_running.lock().unwrap() {
+                    return;
+                }
+                let (participant_id, participant_label) = match &speaker_id {
+                    Some(id) => speaker_id_to_label(id),
+                    None => ("remote_1".to_string(), "Speaker A".to_string()),
+                };
+                use contextcall_core::models::{Speaker, Utterance};
+                let utterance = Utterance {
+                    id: uuid::Uuid::new_v4(),
+                    text: text.clone(),
+                    speaker: Speaker::Them,
+                    participant_id: Some(participant_id.clone()),
+                    participant_label: Some(participant_label.clone()),
+                    timestamp: chrono::Utc::now(),
+                };
+
+                // Emit finalized transcript
+                let payload = TranscriptPayload {
+                    text: text.clone(),
+                    speaker: "them".into(),
+                    participant_id: participant_id.clone(),
+                    participant_label: participant_label.clone(),
+                };
+                app_sg.emit("transcript", &payload).ok();
+
+                // Append to session store and logger
+                let record = SessionRecord {
+                    speaker: Speaker::Them,
+                    participant_id: Some(participant_id.clone()),
+                    participant_label: Some(participant_label.clone()),
+                    text: text.clone(),
+                    timestamp: chrono::Utc::now(),
+                    suggestions: None,
+                    kb_hits: None,
+                    suggestion_decision: None,
+                    surfaced_suggestion_text: None,
+                    conversation_state_summary: None,
+                };
+                state_sg
+                    .session_store
+                    .lock()
+                    .unwrap()
+                    .append_record(&record)
+                    .ok();
+                state_sg.transcript_logger.lock().unwrap().append(
+                    &participant_label,
+                    &text,
+                    chrono::Utc::now(),
+                );
+
+                push_recent_utterance(
+                    &recent_utterances_clone,
+                    utterance.clone(),
+                    suggestion_context_window_secs,
+                );
+            };
+            let app_vol_t = them_app.clone();
+            let state_vol_t = Arc::clone(&them_state);
+            let on_them_vol = move |_text: String| {
+                if !*state_vol_t.is_running.lock().unwrap() {
+                    return;
+                }
+                app_vol_t
+                    .emit(
+                        "transcript-volatile",
+                        &TranscriptPayload {
+                            text: "...".into(),
+                            speaker: "them".into(),
+                            participant_id: "remote_1".into(),
+                            participant_label: "Speaker A".into(),
+                        },
+                    )
+                    .ok();
+            };
+            let progress_app_them = them_app.clone();
+            let progress_state_them = Arc::clone(&them_state);
+            let on_them_progress = std::sync::Arc::new(move |progress: SegmentProgress| {
+                match progress {
+                    SegmentProgress::Captured => {
+                        progress_state_them
+                            .captured_segments
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SegmentProgress::Processed => {
+                        progress_state_them
+                            .processed_segments
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                emit_transcription_progress(&progress_app_them, &progress_state_them);
+            });
+            let mut transcriber =
+                StreamingTranscriber::new(them_backend, them_lang, Box::new(on_them))
+                    .with_volatile(Box::new(on_them_vol))
+                    .with_progress(on_them_progress)
+                    .with_stop_signal(Arc::clone(&them_state.stop_requested))
+                    .with_diarization(settings.diarization_enabled)
+                    .with_clear_speakers_on_start(true);
+            if let Some(worker) = warmed_sys {
+                transcriber = transcriber.with_parakeet_worker(worker);
+            }
+            if let Some(config) = parakeet_config_for_them.clone() {
+                let idle_state = Arc::clone(&them_state);
+                transcriber = transcriber.with_parakeet_worker_idle(Box::new(move |worker| {
+                    if idle_state.shutdown_in_progress.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    store_cached_parakeet_worker(
+                        Arc::clone(&idle_state),
+                        ParakeetWorkerSlot::Sys,
+                        config.clone(),
+                        worker,
+                    );
+                }));
+            }
+            if let Some(worker) = warmed_omni_sys {
+                transcriber = transcriber.with_omni_asr_worker(worker);
+            }
+            if let Some(worker) = warmed_cohere_sys {
+                transcriber = transcriber.with_cohere_transcribe_worker(worker);
+            }
+            transcriber.run(them_stream_leveled).await;
+        });
+        *state_clone.system_audio_task.lock().unwrap() = Some(them_handle);
+
+        let suggestion_app = app_clone.clone();
+        let suggestion_state = Arc::clone(&state_clone);
+        let suggestion_recent_utterances = Arc::clone(&recent_utterances);
+        let suggestion_handle = tauri::async_runtime::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(suggestion_interval_secs));
+            let mut last_checked_utterance_id: Option<uuid::Uuid> = None;
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                if !*suggestion_state.is_running.lock().unwrap() {
+                    break;
+                }
+
+                let settings = suggestion_state.settings.lock().unwrap().clone();
+                if !settings.suggestions_enabled {
+                    *suggestion_state.overlay_suggestion.lock().unwrap() = None;
+                    if let Some(overlay) = suggestion_app.get_webview_window(OVERLAY_LABEL) {
+                        let _ = overlay.hide();
+                    }
+                    continue;
+                }
+
+                let cutoff =
+                    chrono::Utc::now() - chrono::Duration::seconds(suggestion_context_window_secs);
+                let recent_buf = suggestion_recent_utterances
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|u| u.timestamp >= cutoff)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if recent_buf.is_empty() {
+                    continue;
+                }
+
+                let latest_utterance_id = recent_buf.last().map(|u| u.id);
+                if latest_utterance_id.is_none() || latest_utterance_id == last_checked_utterance_id
+                {
+                    continue;
+                }
+                last_checked_utterance_id = latest_utterance_id;
+
+                let transcript_window = recent_buf
+                    .iter()
+                    .map(|u| format!("{}: {}", u.display_label(), u.text))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if transcript_window.trim().is_empty() {
+                    continue;
+                }
+
+                suggestion_app.emit("suggestion-generating", ()).ok();
+                suggestion_app
+                    .emit(
+                        "suggestion-check-started",
+                        &SuggestionCheckPayload {
+                            checked_at: chrono::Utc::now().to_rfc3339(),
+                            surfaced: false,
+                        },
+                    )
+                    .ok();
+
+                {
+                    let mut engine = suggestion_state.suggestion_engine.lock().await;
+                    engine.kb_surfacing_system_prompt = settings.kb_surfacing_system_prompt.clone();
+                    engine.suggestion_synthesis_system_prompt =
+                        settings.suggestion_synthesis_system_prompt.clone();
+                    engine.smart_question_system_prompt =
+                        settings.smart_question_system_prompt.clone();
+                    engine.external_kb_search_instruction =
+                        codex_obsidian_search_instruction(&settings);
+                    engine.response_language = settings.transcription_locale.clone();
+                }
+                let (embed_url, embed_key, embed_model) = embed_config(&settings);
+                use contextcall_core::intelligence::knowledge_base::search_chunks;
+                let kb_snapshot = suggestion_state.kb_search_snapshot.read().await.clone();
+                let kb_snapshot_chunks = kb_snapshot.len();
+
+                let embed_fn = {
+                    let url = embed_url.clone();
+                    let key = embed_key.clone();
+                    let model = embed_model.clone();
+                    move |texts: Vec<String>| {
+                        let url = url.clone();
+                        let key = key.clone();
+                        let model = model.clone();
+                        async move {
+                            contextcall_core::intelligence::embedding_client::embed(
+                                &url,
+                                key.as_deref(),
+                                &model,
+                                &texts,
+                                None,
+                                None,
+                            )
+                            .await
+                        }
+                    }
+                };
+
+                let search_fn = move |emb: &[f32]| -> Vec<contextcall_core::models::KBResult> {
+                    search_chunks(kb_snapshot.as_ref(), emb, 5, 0.4)
+                };
+
+                let complete_fn = {
+                    let settings = settings.clone();
+                    move |messages: Vec<Message>| {
+                        let settings = settings.clone();
+                        async move {
+                            complete_with_settings(
+                                &settings,
+                                messages,
+                                512,
+                                LlmRequestKind::LiveSuggestion,
+                            )
+                            .await
+                        }
+                    }
+                };
+
+                let recent_them = recent_buf
+                    .iter()
+                    .filter(|u| matches!(u.speaker, Speaker::Them))
+                    .collect::<Vec<_>>();
+                if recent_them.is_empty() || recent_buf.len() < 3 {
+                    log::info!(
+                        "suggestion skipped: insufficient context recent_them={} recent_total={}",
+                        recent_them.len(),
+                        recent_buf.len()
+                    );
+                    suggestion_app.emit("suggestion-finished", ()).ok();
+                    continue;
+                }
+
+                let codex_vault_search = settings.llm_provider == "codex-cli"
+                    && codex_obsidian_search_instruction(&settings).is_some();
+                log::info!(
+                    "suggestion check: transcript_chars={} recent_them={} codex_vault_search={} kb_snapshot_chunks={}",
+                    transcript_window.chars().count(),
+                    recent_them.len(),
+                    codex_vault_search,
+                    kb_snapshot_chunks
+                );
+                let mut engine = suggestion_state.suggestion_engine.lock().await;
+                let suggestion = engine
+                    .process_transcript_window(
+                        &transcript_window,
+                        &recent_them,
+                        embed_fn,
+                        search_fn,
+                        complete_fn,
+                    )
+                    .await;
+                let surfaced = suggestion.is_some();
+
+                if let Some(suggestion) = suggestion {
+                    log::info!(
+                        "suggestion surfaced: kind={:?} chars={} kb_hits={} sources={}",
+                        suggestion.kind,
+                        suggestion.text.chars().count(),
+                        suggestion.kb_hits.len(),
+                        suggestion
+                            .kb_hits
+                            .iter()
+                            .take(3)
+                            .map(|hit| hit.source_file.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let payload = SuggestionPayload {
+                        id: suggestion.id.to_string(),
+                        kind: match suggestion.kind {
+                            contextcall_core::models::SuggestionKind::KnowledgeBase => {
+                                "knowledge_base".into()
+                            }
+                            contextcall_core::models::SuggestionKind::SmartQuestion => {
+                                "smart_question".into()
+                            }
+                        },
+                        text: suggestion.text.clone(),
+                        kb_hits: suggestion.kb_hits.clone(),
+                    };
+                    *suggestion_state.overlay_suggestion.lock().unwrap() = Some(payload.clone());
+                    suggestion_app.emit("suggestion", &payload).ok();
+                    if let Ok(overlay) = ensure_overlay_window(&suggestion_app) {
+                        let _ = overlay.show();
+                        emit_overlay_suggestion(overlay, payload.clone());
+                    }
+                } else {
+                    log::info!("suggestion not surfaced");
+                }
+
+                suggestion_app
+                    .emit(
+                        "suggestion-check-finished",
+                        &SuggestionCheckPayload {
+                            checked_at: chrono::Utc::now().to_rfc3339(),
+                            surfaced,
+                        },
+                    )
+                    .ok();
+                suggestion_app.emit("suggestion-finished", ()).ok();
+            }
+        });
+        *state_clone.suggestion_task.lock().unwrap() = Some(suggestion_handle);
+
+        // ── "You" mic capture ──────────────────────────────────────────────
+        // Share stop_requested as the mic's finished signal so that when stop
+        // is clicked the CPAL callback drops its sender, closing the channel
+        // and letting the transcriber drain every buffered chunk before halting.
+        let mic_recorder = state_clone.audio_recorder.lock().unwrap().clone();
+        let mic = CpalMicCapture::new().with_stop_signal(Arc::clone(&state_clone.stop_requested));
+        let mic_stream = mic.buffer_stream_for_device(device_name.as_deref());
+        use futures::StreamExt;
+        let mic_input_level_w = Arc::clone(&state_clone.mic_input_level);
+        let mic_level_w = Arc::clone(&state_clone.mic_level);
+        let mic_gate_threshold_w = Arc::clone(&state_clone.mic_gate_threshold);
+        let mic_transmit_active_w = Arc::clone(&state_clone.mic_transmit_active);
+        let mut echo_processor = MicEchoProcessor::new(echo_reference.clone());
+        echo_processor.set_enabled(settings.echo_cancellation_enabled);
+        echo_processor.set_threshold(f32::from_bits(mic_gate_threshold_w.load(Ordering::Relaxed)));
+        let mic_stream_leveled = mic_stream.map(move |chunk: Vec<f32>| {
+            let input_rms = compute_rms(&chunk);
+            mic_input_level_w.store(input_rms.to_bits(), Ordering::Relaxed);
+            echo_processor
+                .set_threshold(f32::from_bits(mic_gate_threshold_w.load(Ordering::Relaxed)));
+            let mut cleaned = echo_processor.process_chunk(&chunk);
+            if !mic_transmit_active_w.load(Ordering::Relaxed) {
+                cleaned.fill(0.0);
+            }
+            let rms = compute_rms(&cleaned);
+            mic_level_w.store(rms.to_bits(), Ordering::Relaxed);
+            if let Some(ref rec) = mic_recorder {
+                rec.append_mic(&cleaned);
+            }
+            cleaned
+        });
+        let app_y = app_clone.clone();
+        let state_y = Arc::clone(&state_clone);
+        let on_you = move |text: String, _speaker_id: Option<String>| {
+            if !*state_y.is_running.lock().unwrap() {
+                return;
+            }
+            // Text-level echo suppression: discard mic transcripts that closely match
+            // recent system audio transcripts (catches echoes that survive audio-level AEC).
+            if is_text_echo(&text, &recent_utterances, 4) {
+                return;
+            }
+            let payload = TranscriptPayload {
+                text: text.clone(),
+                speaker: "you".into(),
+                participant_id: "you".into(),
+                participant_label: "You".into(),
+            };
+            app_y.emit("transcript", &payload).ok();
+            push_recent_utterance(
+                &recent_utterances,
+                contextcall_core::models::Utterance {
+                    id: uuid::Uuid::new_v4(),
+                    text: text.clone(),
+                    speaker: Speaker::You,
+                    participant_id: Some("you".into()),
+                    participant_label: Some("You".into()),
+                    timestamp: chrono::Utc::now(),
+                },
+                suggestion_context_window_secs,
+            );
+            let record = SessionRecord {
+                speaker: Speaker::You,
+                participant_id: Some("you".into()),
+                participant_label: Some("You".into()),
+                text: text.clone(),
+                timestamp: chrono::Utc::now(),
+                suggestions: None,
+                kb_hits: None,
+                suggestion_decision: None,
+                surfaced_suggestion_text: None,
+                conversation_state_summary: None,
+            };
+            state_y
+                .session_store
+                .lock()
+                .unwrap()
+                .append_record(&record)
+                .ok();
+            state_y
+                .transcript_logger
+                .lock()
+                .unwrap()
+                .append("You", &text, chrono::Utc::now());
+        };
+
+        app_clone.emit("whisper-ready", ()).ok();
+        app_clone.emit("stt-status", &stt_status).ok();
+        let app_vol_y = app_clone.clone();
+        let state_vol_y = Arc::clone(&state_clone);
+        let on_you_vol = move |_text: String| {
+            if !*state_vol_y.is_running.lock().unwrap() {
+                return;
+            }
+            app_vol_y
+                .emit(
+                    "transcript-volatile",
+                    &TranscriptPayload {
+                        text: "...".into(),
+                        speaker: "you".into(),
+                        participant_id: "you".into(),
+                        participant_label: "You".into(),
+                    },
+                )
+                .ok();
+        };
+        let progress_app_you = app_clone.clone();
+        let progress_state_you = Arc::clone(&state_clone);
+        let on_you_progress = std::sync::Arc::new(move |progress: SegmentProgress| {
+            match progress {
+                SegmentProgress::Captured => {
+                    progress_state_you
+                        .captured_segments
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                SegmentProgress::Processed => {
+                    progress_state_you
+                        .processed_segments
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            emit_transcription_progress(&progress_app_you, &progress_state_you);
+        });
+        let mut transcriber = StreamingTranscriber::new(backend, language, Box::new(on_you))
+            .with_volatile(Box::new(on_you_vol))
+            .with_progress(on_you_progress)
+            .with_stop_signal(Arc::clone(&state_clone.stop_requested))
+            .with_diarization(false)
+            .with_clear_speakers_on_start(false);
+        if let Some(worker) = warmed_mic {
+            transcriber = transcriber.with_parakeet_worker(worker);
+        }
+        if let Some(config) = parakeet_config_for_you.clone() {
+            let idle_state = Arc::clone(&state_clone);
+            transcriber = transcriber.with_parakeet_worker_idle(Box::new(move |worker| {
+                if idle_state.shutdown_in_progress.load(Ordering::Relaxed) {
+                    return;
+                }
+                store_cached_parakeet_worker(
+                    Arc::clone(&idle_state),
+                    ParakeetWorkerSlot::Mic,
+                    config.clone(),
+                    worker,
+                );
+            }));
+        }
+        if let Some(worker) = warmed_omni_mic {
+            transcriber = transcriber.with_omni_asr_worker(worker);
+        }
+        if let Some(worker) = warmed_cohere_mic {
+            transcriber = transcriber.with_cohere_transcribe_worker(worker);
+        }
+        transcriber.run(mic_stream_leveled).await;
+    });
+
+    *state.audio_task.lock().unwrap() = Some(handle);
+    emit_transcription_progress(&app, &state);
+    Ok(session_id)
+}
+
+#[tauri::command]
+pub async fn stop_transcription(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    stop_transcription_inner(&app, &state, StopBehavior::user_stop()).await
+}
+
+#[tauri::command]
+pub async fn start_import_transcription(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<String, String> {
+    // Open a file picker for WAV files.
+    let path = {
+        let app_dlg = app.clone();
+        tokio::task::spawn_blocking(move || {
+            app_dlg
+                .dialog()
+                .file()
+                .add_filter("WAV Audio", &["wav", "WAV"])
+                .blocking_pick_file()
+                .and_then(|f| f.into_path().ok())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    };
+    let path = path.ok_or_else(|| "No file selected".to_string())?;
+    log::info!("[import] file selected: {}", path.display());
+
+    // Block concurrent sessions (recording or another import).
+    let mut running = state.is_running.lock().unwrap();
+    if *running {
+        return Err("A session is already running.".into());
+    }
+    *running = true;
+    state
+        .stop_requested
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state.captured_segments.store(0, Ordering::Relaxed);
+    state.processed_segments.store(0, Ordering::Relaxed);
+    drop(running);
+
+    // Start a new session.
+    let session_id = {
+        let mut ss = state.session_store.lock().unwrap();
+        ss.start_session();
+        ss.current_session_id()
+            .map(str::to_owned)
+            .ok_or_else(|| "Failed to create session".to_string())?
+    };
+    state.transcript_logger.lock().unwrap().start_session();
+    state.suggestion_engine.blocking_lock().clear();
+    *state.overlay_suggestion.lock().unwrap() = None;
+
+    let settings = state.settings.lock().unwrap().clone();
+    let (backend, language, _stt_status) = resolve_stt_backend(&app, &settings)?;
+
+    // Imports run through the same transcriber; boot llama-server when selected.
+    if matches!(&backend, SttBackend::LlamaServer { .. }) {
+        let config = llama_server_config(&settings)?;
+        let app_for_error = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = llama_server::ensure_running(config).await {
+                log::error!("[llama-server] startup failed: {e}");
+                app_for_error.emit("import-error", &e).ok();
+            }
+        });
+    }
+
+    let state_clone = Arc::clone(&*state);
+    let app_clone = app.clone();
+    let session_id_for_event = session_id.clone();
+
+    log::info!("[import] starting session {session_id}");
+
+    let handle = tauri::async_runtime::spawn(async move {
+        // Read and normalise the WAV file to 16 kHz mono f32.
+        let samples = match contextcall_core::audio::recorder::read_wav_as_f32_16k(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("[import] failed to read WAV: {e}");
+                app_clone.emit("import-error", &e).ok();
+                *state_clone.is_running.lock().unwrap() = false;
+                state_clone.session_store.lock().unwrap().end_session();
+                state_clone.transcript_logger.lock().unwrap().end_session();
+                return;
+            }
+        };
+
+        let duration_secs = samples.len() as f32 / 16_000.0;
+        log::info!(
+            "[import] loaded {:.1}s of audio ({} samples), starting transcription",
+            duration_secs,
+            samples.len()
+        );
+
+        // Build the transcript callback (same shape as on_you in start_transcription).
+        let app_f = app_clone.clone();
+        let state_f = Arc::clone(&state_clone);
+        let on_final = Box::new(move |text: String, _speaker_id: Option<String>| {
+            let payload = TranscriptPayload {
+                text: text.clone(),
+                speaker: "you".into(),
+                participant_id: "you".into(),
+                participant_label: "You".into(),
+            };
+            app_f.emit("transcript", &payload).ok();
+            let record = SessionRecord {
+                speaker: Speaker::You,
+                participant_id: Some("you".into()),
+                participant_label: Some("You".into()),
+                text: text.clone(),
+                timestamp: chrono::Utc::now(),
+                suggestions: None,
+                kb_hits: None,
+                suggestion_decision: None,
+                surfaced_suggestion_text: None,
+                conversation_state_summary: None,
+            };
+            state_f
+                .session_store
+                .lock()
+                .unwrap()
+                .append_record(&record)
+                .ok();
+            state_f
+                .transcript_logger
+                .lock()
+                .unwrap()
+                .append("You", &text, chrono::Utc::now());
+        });
+
+        // Progress callback — reuses the same counters and event as live recording.
+        let app_p = app_clone.clone();
+        let state_p = Arc::clone(&state_clone);
+        let on_progress = std::sync::Arc::new(move |progress: SegmentProgress| {
+            match progress {
+                SegmentProgress::Captured => {
+                    state_p.captured_segments.fetch_add(1, Ordering::Relaxed);
+                }
+                SegmentProgress::Processed => {
+                    state_p.processed_segments.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            emit_transcription_progress(&app_p, &state_p);
+        });
+
+        // Feed audio through the transcription pipeline in 100 ms chunks.
+        let chunks: Vec<Vec<f32>> = samples.chunks(1600).map(|c| c.to_vec()).collect();
+        let stream = futures::stream::iter(chunks);
+
+        StreamingTranscriber::new(backend, language, on_final)
+            .with_progress(on_progress)
+            .with_stop_signal(Arc::clone(&state_clone.stop_requested))
+            .with_cancel_on_stop(true)
+            .run(stream)
+            .await;
+
+        // Finalise the session — mirror what stop_transcription does.
+        *state_clone.is_running.lock().unwrap() = false;
+        state_clone.session_store.lock().unwrap().end_session();
+        state_clone.transcript_logger.lock().unwrap().end_session();
+        emit_transcription_progress(&app_clone, &state_clone);
+        log::info!(
+            "[import] done — session {}, captured={} processed={}",
+            session_id_for_event,
+            state_clone.captured_segments.load(Ordering::Relaxed),
+            state_clone.processed_segments.load(Ordering::Relaxed),
+        );
+        app_clone
+            .emit("import-complete", &session_id_for_event)
+            .ok();
+    });
+
+    *state.audio_task.lock().unwrap() = Some(handle);
+
+    Ok(session_id)
+}
+
+#[tauri::command]
+pub async fn download_model(app: AppHandle, model: String) -> Result<(), String> {
+    let model_path = AppState::whisper_model_path_for(&app, &model)?;
+    let app_clone = app.clone();
+    let model_clone = model.clone();
+    download::download_model(&model_clone, model_path, move |pct| {
+        app_clone.emit("model-download-progress", pct).ok();
+    })
+    .await?;
+    app.emit("model-download-done", ()).ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn download_stt_model(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let settings = state.settings.lock().unwrap().clone();
+    let selected_provider = selected_stt_provider(&settings).to_string();
+
+    if selected_provider == "faster-whisper" {
+        let config = AppState::faster_whisper_config(&settings);
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "prepare".into(),
+                message: "Preparing faster-whisper runtime directories...".into(),
+            },
+        )
+        .ok();
+        app.emit("model-download-progress", 5).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "venv".into(),
+                message: "Creating and updating the Python environment...".into(),
+            },
+        )
+        .ok();
+        let app_log = app.clone();
+        faster_whisper::install_runtime(&config, move |line| {
+            app_log.emit("stt-install-log", line).ok();
+        })?;
+        app.emit("model-download-progress", 35).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "health".into(),
+                message: "Validating the faster-whisper worker...".into(),
+            },
+        )
+        .ok();
+        faster_whisper::health_check(&config)?;
+        app.emit("model-download-progress", 60).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "model".into(),
+                message: format!(
+                    "Downloading or loading faster-whisper model {}...",
+                    config.model
+                ),
+            },
+        )
+        .ok();
+        let app_log2 = app.clone();
+        faster_whisper::ensure_model(&config, move |line| {
+            app_log2.emit("stt-install-log", line).ok();
+        })?;
+        app.emit("model-download-progress", 100).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "done".into(),
+                message: "faster-whisper is ready.".into(),
+            },
+        )
+        .ok();
+        app.emit("model-download-done", ()).ok();
+        return Ok(());
+    }
+
+    if selected_provider == "parakeet" {
+        let config = AppState::parakeet_config(&settings);
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "prepare".into(),
+                message: "Preparing parakeet runtime directories...".into(),
+            },
+        )
+        .ok();
+        app.emit("model-download-progress", 5).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "venv".into(),
+                message: "Creating and updating the Python environment (this may take a while)..."
+                    .into(),
+            },
+        )
+        .ok();
+        let app_log = app.clone();
+        parakeet::install_runtime(&config, move |line| {
+            app_log.emit("stt-install-log", line).ok();
+        })?;
+        app.emit("model-download-progress", 35).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "health".into(),
+                message: "Validating the parakeet worker...".into(),
+            },
+        )
+        .ok();
+        parakeet::health_check(&config)?;
+        app.emit("model-download-progress", 60).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "model".into(),
+                message: format!("Downloading or loading parakeet model {}...", config.model),
+            },
+        )
+        .ok();
+        let app_log2 = app.clone();
+        parakeet::ensure_model(&config, move |line| {
+            app_log2.emit("stt-install-log", line).ok();
+        })?;
+        app.emit("model-download-progress", 100).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "done".into(),
+                message: "parakeet is ready.".into(),
+            },
+        )
+        .ok();
+        app.emit("model-download-done", ()).ok();
+        return Ok(());
+    }
+
+    if selected_provider == "omni-asr" {
+        let config = AppState::omni_asr_config(&settings);
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "prepare".into(),
+                message: "Preparing Omni-ASR runtime directories...".into(),
+            },
+        )
+        .ok();
+        app.emit("model-download-progress", 5).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "venv".into(),
+                message: "Creating and updating the Python environment...".into(),
+            },
+        )
+        .ok();
+        let app_log = app.clone();
+        omni_asr::install_runtime(&config, move |line| {
+            app_log.emit("stt-install-log", line).ok();
+        })?;
+        app.emit("model-download-progress", 35).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "health".into(),
+                message: "Validating the Omni-ASR worker...".into(),
+            },
+        )
+        .ok();
+        let app_log_health = app.clone();
+        omni_asr::health_check_with_log(&config, move |line| {
+            app_log_health.emit("stt-install-log", line).ok();
+        })?;
+        app.emit("model-download-progress", 60).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "model".into(),
+                message: format!("Downloading or loading Omni-ASR model {}...", config.model),
+            },
+        )
+        .ok();
+        let app_log2 = app.clone();
+        omni_asr::ensure_model(&config, move |line| {
+            app_log2.emit("stt-install-log", line).ok();
+        })?;
+        app.emit("model-download-progress", 100).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "done".into(),
+                message: "Omni-ASR is ready.".into(),
+            },
+        )
+        .ok();
+        app.emit("model-download-done", ()).ok();
+        return Ok(());
+    }
+
+    if selected_provider == "cohere-transcribe" {
+        let config = AppState::cohere_transcribe_config(&settings);
+        let emit_log = |line: &str| {
+            app.emit("stt-install-log", line.to_string()).ok();
+        };
+        emit_log("[cohere-transcribe] Starting setup");
+        emit_log(&format!(
+            "[cohere-transcribe] Requested locale: {}",
+            settings.transcription_locale
+        ));
+        emit_log(&format!(
+            "[cohere-transcribe] Model: {} | Device: {}",
+            config.model, config.device
+        ));
+        if config
+            .hugging_face_token
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            emit_log("[cohere-transcribe] Setup blocked: missing Hugging Face token");
+            return Err(cohere_transcribe::missing_token_message());
+        }
+        if !cohere_transcribe::supports_locale(&settings.transcription_locale) {
+            emit_log(&format!(
+                "[cohere-transcribe] Setup blocked: unsupported locale {}",
+                settings.transcription_locale
+            ));
+            return Err(format!(
+                "Cohere Transcribe does not support locale {}. Choose a supported explicit locale before setup.",
+                settings.transcription_locale
+            ));
+        }
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "prepare".into(),
+                message: "Preparing Cohere Transcribe runtime directories...".into(),
+            },
+        )
+        .ok();
+        app.emit("model-download-progress", 5).ok();
+        emit_log("[cohere-transcribe] Runtime preparation started");
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "venv".into(),
+                message: "Creating and updating the Python environment...".into(),
+            },
+        )
+        .ok();
+        let app_log = app.clone();
+        cohere_transcribe::install_runtime(&config, move |line| {
+            app_log.emit("stt-install-log", line).ok();
+        })?;
+        emit_log("[cohere-transcribe] Runtime installation finished");
+        app.emit("model-download-progress", 35).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "health".into(),
+                message: "Validating the Cohere Transcribe worker...".into(),
+            },
+        )
+        .ok();
+        emit_log("[cohere-transcribe] Worker health check started");
+        cohere_transcribe::health_check(&config)?;
+        emit_log("[cohere-transcribe] Worker health check passed");
+        app.emit("model-download-progress", 60).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "model".into(),
+                message: format!(
+                    "Downloading or loading Cohere Transcribe model {}...",
+                    config.model
+                ),
+            },
+        )
+        .ok();
+        emit_log("[cohere-transcribe] Model ensure/download started");
+        let app_log2 = app.clone();
+        cohere_transcribe::ensure_model(&config, move |line| {
+            app_log2.emit("stt-install-log", line).ok();
+        })?;
+        emit_log("[cohere-transcribe] Model ensure/download finished");
+        app.emit("model-download-progress", 100).ok();
+        app.emit(
+            "stt-setup-status",
+            &SttSetupStatusPayload {
+                stage: "done".into(),
+                message: "Cohere Transcribe is ready.".into(),
+            },
+        )
+        .ok();
+        emit_log("[cohere-transcribe] Setup complete, warming workers");
+        warm_cohere_transcribe_workers(Arc::clone(&*state), app.clone());
+        app.emit("model-download-done", ()).ok();
+        return Ok(());
+    }
+
+    if selected_provider == "llama-server" {
+        return run_llama_server_setup(&app, &settings).await;
+    }
+
+    let model = resolve_whisper_model(&settings).to_string();
+    download_model(app, model).await
+}
+
+/// Self-service setup for the Gemma 4 (llama-server) backend: downloads the pinned
+/// llama.cpp runtime and the GGUF model + audio mmproj (reusing LM Studio /
+/// Hugging Face cache copies when present), then boots the server until healthy.
+async fn run_llama_server_setup(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
+    app.emit(
+        "stt-setup-status",
+        &SttSetupStatusPayload {
+            stage: "prepare".into(),
+            message: "Checking Gemma 4 (llama-server) assets...".into(),
+        },
+    )
+    .ok();
+    app.emit("model-download-progress", 0).ok();
+
+    let app_progress = app.clone();
+    let assets = llama_server::ensure_assets(move |progress| {
+        // Map per-stage percentages onto one overall bar:
+        // binary 0–10, model 10–95, mmproj 95–100.
+        let overall = match progress.stage {
+            "download-binary" => progress.pct / 10,
+            "extract-binary" => 10,
+            "download-model" => 10 + progress.pct * 85 / 100,
+            "download-mmproj" => 95 + progress.pct / 20,
+            _ => progress.pct,
+        };
+        app_progress.emit("model-download-progress", overall).ok();
+        app_progress
+            .emit(
+                "stt-setup-status",
+                &SttSetupStatusPayload {
+                    stage: "model".into(),
+                    message: progress.message.clone(),
+                },
+            )
+            .ok();
+        if progress.pct % 10 == 0 {
+            app_progress
+                .emit("stt-install-log", format!("[llama-server] {}", progress.message))
+                .ok();
+        }
+    })
+    .await?;
+
+    app.emit(
+        "stt-setup-status",
+        &SttSetupStatusPayload {
+            stage: "health".into(),
+            message: "Starting llama-server and loading Gemma 4 12B...".into(),
+        },
+    )
+    .ok();
+    let config = assets
+        .into_config(settings.llama_server_port)
+        .ok_or_else(|| "llama-server assets are incomplete after setup".to_string())?;
+    llama_server::ensure_running(config).await?;
+
+    app.emit("model-download-progress", 100).ok();
+    app.emit(
+        "stt-setup-status",
+        &SttSetupStatusPayload {
+            stage: "done".into(),
+            message: "Gemma 4 (llama-server) is ready.".into(),
+        },
+    )
+    .ok();
+    app.emit("model-download-done", ()).ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn setup_llama_server(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let settings = state.settings.lock().unwrap().clone();
+    run_llama_server_setup(&app, &settings).await
+}
+
+#[tauri::command]
+pub async fn get_llama_server_status(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<LlamaServerStatusPayload, String> {
+    let port = state.settings.lock().unwrap().llama_server_port;
+    let assets = llama_server::assets_status();
+    let running = llama_server::is_running().await;
+    let ready = assets.ready();
+    let message = if running {
+        "llama-server is running.".into()
+    } else if ready {
+        "Gemma 4 (llama-server) is ready to start.".into()
+    } else {
+        format!(
+            "Gemma 4 (llama-server) needs setup (~{} GB download, reuses LM Studio models when found).",
+            llama_server::MODEL_DOWNLOAD_GB
+        )
+    };
+    Ok(LlamaServerStatusPayload {
+        binary_ready: assets.binary.is_some(),
+        model_ready: assets.model.is_some(),
+        mmproj_ready: assets.mmproj.is_some(),
+        ready,
+        running,
+        port,
+        model_source: assets.model_source.clone(),
+        model_path: assets.model.as_ref().map(|p| p.display().to_string()),
+        message,
+    })
+}
+
+/// Pre-start llama-server at app launch when it is the selected STT or LLM
+/// provider and its assets are already in place, so the first recording or
+/// suggestion does not pay the model-load delay.
+pub fn warm_llama_server(state: Arc<AppState>, _app: AppHandle) {
+    let settings = state.settings.lock().unwrap().clone();
+    let uses_llama = selected_stt_provider(&settings) == "llama-server"
+        || settings.llm_provider == "llama-server";
+    if !uses_llama {
+        return;
+    }
+    let Ok(config) = llama_server_config(&settings) else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = llama_server::ensure_running(config).await {
+            log::warn!("[llama-server] warmup failed: {e}");
+        }
+    });
+}
+
+async fn maybe_publish_to_obsidian(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    settings: &AppSettings,
+    session_id: &str,
+    notes: &EnhancedNotes,
+    records: &[SessionRecord],
+) -> Result<(), String> {
+    let Some(obsidian) = configured_obsidian(settings) else {
+        return Ok(());
+    };
+
+    emit_notes_publish_status(
+        app,
+        session_id,
+        "publishing",
+        "Publishing summary to Obsidian...",
+    );
+
+    let started_at = parse_session_started_at(session_id);
+    if let Err(err) = obsidian.publish_session(session_id, started_at, notes, records) {
+        emit_notes_publish_status(
+            app,
+            session_id,
+            "error",
+            format!("Failed to save summary to Obsidian: {err}"),
+        );
+        return Err(err);
+    }
+
+    if let Err(err) = sync_knowledge_base(Some(app), state, settings).await {
+        log::warn!("Obsidian note published but KB reindex failed: {err}");
+        emit_notes_publish_status(
+            app,
+            session_id,
+            "ready",
+            "Summary saved to Obsidian. Vault refresh failed; reindex from Settings if needed.",
+        );
+        return Ok(());
+    }
+
+    emit_notes_publish_status(app, session_id, "ready", "Summary saved to Obsidian.");
+    Ok(())
+}
+
+fn resolve_template_for_generation(
+    state: &Arc<AppState>,
+    settings: &AppSettings,
+    template_id: Option<&str>,
+) -> MeetingTemplate {
+    let requested_template_id = template_id
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .or_else(|| Some(default_template_id(settings)));
+
+    let store = state.template_store.lock().unwrap();
+    requested_template_id
+        .and_then(|id| store.get(id).cloned())
+        .unwrap_or_else(|| MeetingTemplate::built_ins().into_iter().next().unwrap())
+}
+
+async fn generate_notes_for_session(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    session_id: String,
+    template_id: Option<String>,
+    behavior: NotesGenerationBehavior,
+) -> Result<String, String> {
+    let settings = state.settings.lock().unwrap().clone();
+    let will_publish_to_obsidian =
+        behavior.publish_to_obsidian && configured_obsidian(&settings).is_some();
+    let records = state
+        .session_store
+        .lock()
+        .unwrap()
+        .load_transcript(&session_id);
+    let transcript_chars: usize = records.iter().map(|record| record.text.len()).sum();
+    log::info!(
+        "generate_notes requested: session_id={}, template_id={:?}, utterances={}, transcript_chars={}",
+        session_id,
+        template_id,
+        records.len(),
+        transcript_chars
+    );
+    if records.is_empty() {
+        log::warn!(
+            "generate_notes aborted: transcript is empty for session_id={}",
+            session_id
+        );
+        return Err(format!("No transcript found for session `{session_id}`."));
+    }
+
+    if behavior.emit_status {
+        emit_notes_publish_status(
+            app,
+            &session_id,
+            "generating",
+            if will_publish_to_obsidian {
+                "Generating summary for Obsidian..."
+            } else {
+                "Generating notes..."
+            },
+        );
+    }
+
+    let template = resolve_template_for_generation(state, &settings, template_id.as_deref());
+
+    ensure_llama_for_provider(&settings, &settings.llm_provider).await?;
+
+    let result = if settings.llm_provider == "codex-cli" {
+        let messages =
+            notes_engine::build_notes_messages(&records, &template, &settings.transcription_locale);
+        let markdown =
+            complete_with_settings(&settings, messages, 4096, LlmRequestKind::Notes).await?;
+        if behavior.emit_chunks {
+            app.emit("notes-chunk", markdown.clone()).ok();
+        }
+        Ok(markdown)
+    } else if behavior.emit_chunks {
+        let app_c = app.clone();
+        let on_chunk = move |chunk: String| {
+            app_c.emit("notes-chunk", chunk).ok();
+        };
+        let config = http_llm_config_for_provider(&settings, &settings.llm_provider);
+
+        notes_engine::generate_notes(
+            &records,
+            &template,
+            &config.base_url,
+            config.api_key.as_deref(),
+            &config.model,
+            &settings.transcription_locale,
+            on_chunk,
+        )
+        .await
+    } else {
+        let config = http_llm_config_for_provider(&settings, &settings.llm_provider);
+        notes_engine::generate_notes(
+            &records,
+            &template,
+            &config.base_url,
+            config.api_key.as_deref(),
+            &config.model,
+            &settings.transcription_locale,
+            |_| {},
+        )
+        .await
+    };
+
+    // Strip any leaked Gemma channel tokens from the saved notes markdown.
+    let result = if settings.llm_provider == "llama-server" {
+        result.map(|text| llama_server::sanitize_output(&text))
+    } else {
+        result
+    };
+
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => {
+            if behavior.emit_status {
+                emit_notes_publish_status(
+                    app,
+                    &session_id,
+                    "error",
+                    if will_publish_to_obsidian {
+                        format!("Failed to generate summary for Obsidian: {err}")
+                    } else {
+                        format!("Failed to generate notes: {err}")
+                    },
+                );
+            }
+            return Err(err);
+        }
+    };
+
+    let enhanced_notes = contextcall_core::models::EnhancedNotes {
+        template: (&template).into(),
+        generated_at: chrono::Utc::now(),
+        markdown: result.clone(),
+    };
+
+    if behavior.persist_notes {
+        state
+            .session_store
+            .lock()
+            .unwrap()
+            .save_notes(&session_id, enhanced_notes.clone());
+        emit_notes_ready(app, &session_id, &enhanced_notes);
+    }
+
+    if will_publish_to_obsidian {
+        if let Err(err) = maybe_publish_to_obsidian(
+            app,
+            state,
+            &settings,
+            &session_id,
+            &enhanced_notes,
+            &records,
+        )
+        .await
+        {
+            log::warn!("Notes generated but publishing to Obsidian failed: {err}");
+        }
+    } else if behavior.emit_status {
+        emit_notes_publish_status(app, &session_id, "ready", "Notes generated.");
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn generate_notes(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    session_id: String,
+    template_id: Option<String>,
+) -> Result<String, String> {
+    generate_notes_for_session(
+        &app,
+        &state,
+        session_id,
+        template_id,
+        NotesGenerationBehavior::persisted(true),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn generate_preview_notes(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    session_id: String,
+    template_id: Option<String>,
+) -> Result<String, String> {
+    generate_notes_for_session(
+        &app,
+        &state,
+        session_id,
+        template_id,
+        NotesGenerationBehavior::preview(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn index_kb(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<usize, String> {
+    let settings = state.settings.lock().unwrap().clone();
+    sync_knowledge_base(Some(&app), &state, &settings).await
+}
+
+#[tauri::command]
+pub fn update_kb_folder(folder: String, state: tauri::State<'_, Arc<AppState>>) {
+    let mut s = state.settings.lock().unwrap();
+    s.kb_folder_path = Some(folder);
+    s.save();
+    reinitialize_knowledge_base(&state, &s);
+}
+
+#[tauri::command]
+pub fn suggestion_feedback(
+    session_id: Option<String>,
+    suggestion_id: String,
+    helpful: bool,
+    state: tauri::State<'_, Arc<AppState>>,
+) {
+    log::info!(
+        "suggestion_feedback: id={} helpful={}",
+        suggestion_id,
+        helpful
+    );
+
+    let session_id = session_id.or_else(|| {
+        let session_store = state.session_store.lock().unwrap();
+        session_store.current_session_id().map(str::to_owned)
+    });
+
+    if let Some(session_id) = session_id {
+        state
+            .session_store
+            .lock()
+            .unwrap()
+            .save_suggestion_feedback(
+                &session_id,
+                SuggestionFeedbackEntry {
+                    suggestion_id,
+                    helpful,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+    }
+}
+
+#[tauri::command]
+pub fn show_overlay(app: AppHandle) -> Result<(), String> {
+    let w = ensure_overlay_window(&app)?;
+    w.show().map_err(|e| e.to_string())?;
+    let _ = w.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn show_overlay_preview(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    id: String,
+    text: String,
+) -> Result<(), String> {
+    *state.overlay_suggestion.lock().unwrap() = Some(SuggestionPayload {
+        id,
+        kind: "preview".into(),
+        text,
+        kb_hits: Vec::new(),
+    });
+
+    let w = ensure_overlay_window(&app)?;
+    w.show().map_err(|e| e.to_string())?;
+    let _ = w.set_focus();
+    if let Some(payload) = state.overlay_suggestion.lock().unwrap().clone() {
+        emit_overlay_suggestion(w, payload);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn hide_overlay(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    *state.overlay_suggestion.lock().unwrap() = None;
+    if let Some(w) = app.get_webview_window(OVERLAY_LABEL) {
+        w.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_overlay_suggestion(state: tauri::State<'_, Arc<AppState>>) -> Option<SuggestionPayload> {
+    state.overlay_suggestion.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn set_overlay_position(app: AppHandle, x: i32, y: i32) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(OVERLAY_LABEL) {
+        w.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_overlay_size(app: AppHandle, width: u32, height: u32) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(OVERLAY_LABEL) {
+        w.set_size(tauri::Size::Logical(tauri::LogicalSize {
+            width: width as f64,
+            height: height as f64,
+        }))
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_content_protection(app: AppHandle, enabled: bool) -> Result<(), String> {
+    for label in ["main", "overlay"] {
+        if let Some(w) = app.get_webview_window(label) {
+            w.set_content_protected(enabled)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn choose_folder(app: AppHandle) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .blocking_pick_folder()
+            .and_then(|f| f.into_path().ok())
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[tauri::command]
+pub async fn choose_obsidian_include_folder(
+    app: AppHandle,
+    vault_path: String,
+) -> Result<String, String> {
+    let vault_path_buf = PathBuf::from(vault_path);
+    let dialog_directory = vault_path_buf.clone();
+    let selected = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_directory(&dialog_directory)
+            .blocking_pick_folder()
+            .and_then(|folder| folder.into_path().ok())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .ok_or_else(|| "No folder selected".to_string())?;
+
+    let relative = selected
+        .strip_prefix(&vault_path_buf)
+        .map_err(|_| "Selected folder must be inside the Obsidian vault".to_string())?;
+    let normalized = normalize_relative_folder(&relative.to_string_lossy());
+    if normalized.as_os_str().is_empty() {
+        return Err("Choose a subfolder inside the vault, not the vault root".into());
+    }
+
+    Ok(normalized.to_string_lossy().replace('\\', "/"))
+}
+
+#[tauri::command]
+pub fn list_sessions(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Vec<contextcall_core::models::SessionIndex> {
+    state.session_store.lock().unwrap().load_session_index()
+}
+
+#[tauri::command]
+pub fn load_session(id: String, state: tauri::State<'_, Arc<AppState>>) -> SessionDetailsPayload {
+    let store = state.session_store.lock().unwrap();
+    SessionDetailsPayload {
+        transcript: store.load_transcript(&id),
+        notes: store.load_notes(&id),
+    }
+}
+
+#[tauri::command]
+pub fn load_session_notes(
+    id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Option<EnhancedNotes> {
+    state.session_store.lock().unwrap().load_notes(&id)
+}
+
+#[tauri::command]
+pub fn list_templates(state: tauri::State<'_, Arc<AppState>>) -> Vec<MeetingTemplate> {
+    state.template_store.lock().unwrap().templates().to_vec()
+}
+
+#[tauri::command]
+pub fn save_template(
+    template: MeetingTemplate,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let mut store = state.template_store.lock().unwrap();
+    if store.get(template.id).is_some() {
+        store.update(template);
+    } else {
+        store.add(template);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_template(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    state.template_store.lock().unwrap().delete(uuid);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reset_template(id: String, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    state.template_store.lock().unwrap().reset_to_default(uuid);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_transcript(
+    app: AppHandle,
+    content: String,
+    default_name: String,
+) -> Result<(), String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let file_path = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(&default_name)
+            .add_filter("Markdown", &["md"])
+            .add_filter("Text", &["txt"])
+            .add_filter("JSON", &["json"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("No file selected")?;
+
+    let path = file_path.into_path().map_err(|e| e.to_string())?;
+    tokio::fs::write(&path, content)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn finish_recording(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<RecordingFilesPayload, String> {
+    let recorder = state
+        .audio_recorder
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or("No active recording to finalize")?;
+    tokio::task::spawn_blocking(move || {
+        // Capture paths before finish() so we can clean up on failure.
+        let mic_path = recorder.mic_path.to_string_lossy().into_owned();
+        let sys_path = recorder.sys_path.to_string_lossy().into_owned();
+        recorder.finish().map_err(|e| {
+            let _ = std::fs::remove_file(&mic_path);
+            let _ = std::fs::remove_file(&sys_path);
+            e.to_string()
+        })?;
+        Ok(RecordingFilesPayload { mic_path, sys_path })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn save_recording_file(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    source_path: String,
+    default_name: String,
+) -> Result<(), String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let last_dir = state.settings.lock().unwrap().last_recording_dir.clone();
+
+    let dest = tokio::task::spawn_blocking(move || {
+        let mut builder = app
+            .dialog()
+            .file()
+            .set_file_name(&default_name)
+            .add_filter("WAV Audio", &["wav"]);
+        if let Some(ref dir) = last_dir {
+            builder = builder.set_directory(dir);
+        }
+        builder.blocking_save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("No file selected")?;
+
+    let dest_path = dest.into_path().map_err(|e| e.to_string())?;
+    tokio::fs::copy(&source_path, &dest_path)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(dir) = dest_path.parent() {
+        let mut settings = state.settings.lock().unwrap();
+        settings.last_recording_dir = Some(dir.to_string_lossy().into_owned());
+        settings.save();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_recording_merged(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    mic_path: String,
+    sys_path: String,
+    default_name: String,
+) -> Result<(), String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let last_dir = state.settings.lock().unwrap().last_recording_dir.clone();
+
+    let dest = tokio::task::spawn_blocking(move || {
+        let mut builder = app
+            .dialog()
+            .file()
+            .set_file_name(&default_name)
+            .add_filter("WAV Audio", &["wav"]);
+        if let Some(ref dir) = last_dir {
+            builder = builder.set_directory(dir);
+        }
+        builder.blocking_save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("No file selected")?;
+
+    let dest_path = dest.into_path().map_err(|e| e.to_string())?;
+
+    let dest_path_clone = dest_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mic = std::path::Path::new(&mic_path);
+        let sys = std::path::Path::new(&sys_path);
+        AudioRecorder::merge(mic, sys, &dest_path_clone)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if let Some(dir) = dest_path.parent() {
+        let mut settings = state.settings.lock().unwrap();
+        settings.last_recording_dir = Some(dir.to_string_lossy().into_owned());
+        settings.save();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn discard_recording_files(
+    state: tauri::State<'_, Arc<AppState>>,
+    mic_path: String,
+    sys_path: String,
+) -> Result<(), String> {
+    let recorder = state.audio_recorder.lock().unwrap().take();
+    if let Some(rec) = recorder {
+        // Finalize WAV headers so the files are valid before deletion. Drop impl
+        // would also attempt finalization but swallows errors silently.
+        let _ = tokio::task::spawn_blocking(move || rec.finish()).await;
+    }
+    let _ = tokio::fs::remove_file(&mic_path).await;
+    let _ = tokio::fs::remove_file(&sys_path).await;
+    Ok(())
+}
+
+// ── Mic calibration commands ─────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn start_calibration_preview(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if *state.is_running.lock().unwrap() {
+        return Err("Recording session is active — use audio-level events instead".into());
+    }
+    // Stop any existing preview first
+    state.preview_stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = state.preview_task.lock().unwrap().take() {
+        handle.abort();
+    }
+
+    let device_name = state.settings.lock().unwrap().input_device_name.clone();
+    state.preview_stop.store(false, Ordering::Relaxed);
+    let stop_flag = Arc::clone(&state.preview_stop);
+
+    let handle = tauri::async_runtime::spawn(async move {
+        use futures::StreamExt;
+        let mic = CpalMicCapture::new().with_stop_signal(Arc::clone(&stop_flag));
+        let mut stream = mic.buffer_stream_for_device(device_name.as_deref());
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut level_accum: Vec<f32> = Vec::new();
+
+        loop {
+            tokio::select! {
+                chunk = stream.next() => {
+                    match chunk {
+                        Some(samples) => level_accum.extend_from_slice(&samples),
+                        None => break,
+                    }
+                }
+                _ = interval.tick() => {
+                    if stop_flag.load(Ordering::Relaxed) { break; }
+                    if !level_accum.is_empty() {
+                        let level = compute_rms(&level_accum);
+                        level_accum.clear();
+                        app.emit("calibration-audio-level", &CalibrationAudioLevelPayload { level }).ok();
+                    }
+                }
+            }
+        }
+    });
+
+    *state.preview_task.lock().unwrap() = Some(handle);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_calibration_preview(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state.preview_stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = state.preview_task.lock().unwrap().take() {
+        handle.abort();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn calibrate_mic_threshold(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<f32, String> {
+    if *state.is_running.lock().unwrap() {
+        return Err("Cannot calibrate during an active recording".into());
+    }
+
+    // Stop any running preview so the device is free
+    state.preview_stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = state.preview_task.lock().unwrap().take() {
+        handle.abort();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let device_name = state.settings.lock().unwrap().input_device_name.clone();
+
+    // Capture 3 seconds in a dedicated task (CpalMicCapture must stay on one task)
+    let block_rmses = tauri::async_runtime::spawn(async move {
+        use futures::StreamExt;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let mic = CpalMicCapture::new().with_stop_signal(Arc::clone(&stop));
+        let mut stream = mic.buffer_stream_for_device(device_name.as_deref());
+        let mut accum: Vec<f32> = Vec::new();
+        let mut rmses: Vec<f32> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                stop2.store(true, Ordering::Relaxed);
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(500), stream.next()).await {
+                Ok(Some(chunk)) => {
+                    accum.extend_from_slice(&chunk);
+                    while accum.len() >= 256 {
+                        let block: Vec<f32> = accum.drain(..256).collect();
+                        rmses.push(compute_rms(&block));
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        rmses
+    })
+    .await
+    .map_err(|e| format!("Capture task failed: {e}"))?;
+
+    if block_rmses.is_empty() {
+        return Err("No audio captured — check your microphone".into());
+    }
+
+    let calibrated_rms = top_percentile_mean(&block_rmses, 0.30);
+
+    if calibrated_rms < 0.001 {
+        return Err("Level too low — check your microphone".into());
+    }
+
+    {
+        let mut settings = state.settings.lock().unwrap();
+        settings.mic_calibration_rms = Some(calibrated_rms);
+        state
+            .mic_gate_threshold
+            .store(mic_gate_threshold(&settings).to_bits(), Ordering::Relaxed);
+        settings.save();
+    }
+
+    Ok(calibrated_rms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contextcall_core::settings::{AppSettings, MicCaptureMode};
+
+    #[test]
+    fn app_state_initializes_without_panic() {
+        let state = AppState::new();
+        assert!(!*state.is_running.lock().unwrap());
+    }
+
+    #[test]
+    fn mic_gate_threshold_uses_calibration_and_multiplier() {
+        let mut settings = AppSettings::default();
+        settings.mic_calibration_rms = Some(0.05);
+        settings.mic_threshold_multiplier = 0.6;
+        assert!((super::mic_gate_threshold(&settings) - 0.03).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mic_gate_threshold_is_zero_without_calibration() {
+        let mut settings = AppSettings::default();
+        settings.mic_calibration_rms = None;
+        settings.mic_threshold_multiplier = 0.6;
+        assert_eq!(super::mic_gate_threshold(&settings), 0.0);
+    }
+
+    #[test]
+    fn mic_transmit_defaults_to_enabled_in_auto_mode() {
+        let settings = AppSettings::default();
+        assert!(super::mic_transmit_enabled_by_default(&settings));
+        assert!(super::mic_transmit_active_for_sources(
+            &settings, false, false
+        ));
+    }
+
+    #[test]
+    fn mic_transmit_follows_button_state_in_push_to_talk_mode() {
+        let mut settings = AppSettings::default();
+        settings.mic_capture_mode = MicCaptureMode::PushToTalk;
+        assert!(!super::mic_transmit_enabled_by_default(&settings));
+        assert!(!super::mic_transmit_active_for_sources(
+            &settings, false, false
+        ));
+        assert!(super::mic_transmit_active_for_sources(
+            &settings, true, false
+        ));
+        assert!(super::mic_transmit_active_for_sources(
+            &settings, false, true
+        ));
+    }
+
+    #[test]
+    fn push_to_talk_shortcut_maps_to_plugin_format() {
+        assert_eq!(
+            super::push_to_talk_shortcut_for_plugin("Ctrl+Shift+Space").unwrap(),
+            "ctrl+shift+space"
+        );
+        assert_eq!(
+            super::push_to_talk_shortcut_for_plugin("Meta+F9").unwrap(),
+            "super+f9"
+        );
+    }
+
+    #[test]
+    fn push_to_talk_shortcut_rejects_modifier_only_bindings() {
+        let error = super::push_to_talk_shortcut_for_plugin("Ctrl+Shift").unwrap_err();
+        assert!(
+            error.contains("non-modifier"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn settings_change_set_only_flags_relevant_subsystems() {
+        let previous = AppSettings::default();
+        let mut next = previous.clone();
+        next.embedding_provider = "ollama".into();
+        next.ollama_embed_model = "nomic-embed-text-v2".into();
+        next.mic_capture_mode = MicCaptureMode::PushToTalk;
+        next.push_to_talk_hotkey = "Ctrl+Space".into();
+        next.hide_from_screen_share = !previous.hide_from_screen_share;
+
+        let changes = SettingsChangeSet::between(&previous, &next);
+        assert!(changes.kb_config_changed);
+        assert!(changes.push_to_talk_changed);
+        assert!(changes.content_protection_changed);
+        assert!(!changes.stt_config_changed);
+    }
+
+    #[test]
+    fn codex_cli_resolves_as_llm_provider_without_changing_embeddings() {
+        let mut settings = AppSettings::default();
+        settings.llm_provider = "codex-cli".into();
+        settings.embedding_provider = "openai".into();
+
+        assert_eq!(
+            resolve_llm_provider(&settings),
+            ResolvedLlmProvider::CodexCli
+        );
+        let (embed_url, _embed_key, embed_model) = embed_config(&settings);
+        assert_eq!(embed_url, "http://127.0.0.1:1234/v1");
+        assert_eq!(embed_model, "text-embedding-nomic-embed-text-v1.5");
+    }
+
+    #[test]
+    fn codex_cli_fallback_provider_is_explicit() {
+        let mut settings = AppSettings::default();
+        settings.codex_cli_fallback_provider = "disabled".into();
+        assert_eq!(codex_fallback_provider(&settings), None);
+
+        settings.codex_cli_fallback_provider = "ollama".into();
+        assert_eq!(codex_fallback_provider(&settings), Some("ollama"));
+    }
+
+    #[test]
+    fn codex_cli_config_uses_isolated_workspace_and_timeouts() {
+        let mut settings = AppSettings::default();
+        settings.codex_cli_path = "".into();
+        settings.codex_cli_model = "gpt-5.4".into();
+
+        let live = codex_cli_config(&settings, LlmRequestKind::LiveSuggestion);
+        assert_eq!(live.command_path, "codex");
+        assert_eq!(live.model.as_deref(), Some("gpt-5.4"));
+        assert!(live.working_dir.ends_with("codex-workspace"));
+        assert_eq!(live.timeout, Duration::from_secs(45));
+        assert!(!live.allow_workspace_search);
+
+        let notes = codex_cli_config(&settings, LlmRequestKind::Notes);
+        assert_eq!(notes.timeout, Duration::from_secs(120));
+        assert!(!notes.allow_workspace_search);
+    }
+
+    #[test]
+    fn codex_obsidian_search_instruction_requires_codex_and_vault() {
+        let mut settings = AppSettings::default();
+        settings.llm_provider = "openai".into();
+        settings.obsidian_vault_path = Some(".".into());
+        assert!(codex_obsidian_search_instruction(&settings).is_none());
+
+        settings.llm_provider = "codex-cli".into();
+        settings.obsidian_notes_folder = "Notes".into();
+        settings.obsidian_transcripts_folder = "Transcripts".into();
+        let instruction = codex_obsidian_search_instruction(&settings).unwrap();
+        assert!(instruction.contains("current working directory"));
+        assert!(instruction.contains("Notes"));
+        assert!(instruction.contains("Transcripts"));
+    }
+
+    #[test]
+    fn codex_json_detection_identifies_unusable_responses() {
+        let messages = vec![
+            Message::system("Return only valid JSON."),
+            Message::user("Should this surface?"),
+        ];
+        assert!(messages_require_json_response(&messages));
+        assert!(is_valid_json_response(
+            "```json\n{\"shouldSurface\": false}\n```"
+        ));
+        assert!(!is_valid_json_response("not json"));
+    }
+
+    #[test]
+    fn speaker_id_to_label_parses_speaker_0() {
+        let (pid, label) = speaker_id_to_label("speaker_0");
+        assert_eq!(pid, "speaker_0");
+        assert_eq!(label, "Speaker 1");
+    }
+
+    #[test]
+    fn speaker_id_to_label_parses_speaker_4() {
+        let (pid, label) = speaker_id_to_label("speaker_4");
+        assert_eq!(pid, "speaker_4");
+        assert_eq!(label, "Speaker 5");
+    }
+
+    #[test]
+    fn speaker_id_to_label_falls_back_on_bad_format() {
+        let (pid, label) = speaker_id_to_label("unknown");
+        assert_eq!(pid, "remote_1");
+        assert_eq!(label, "Speaker A");
+    }
+
+    #[test]
+    fn speaker_id_to_label_falls_back_on_non_integer() {
+        let (pid, label) = speaker_id_to_label("speaker_abc");
+        assert_eq!(pid, "remote_1");
+        assert_eq!(label, "Speaker A");
+    }
+
+    #[test]
+    fn top_percentile_mean_known_inputs() {
+        let vals = vec![0.1f32, 0.5, 0.3, 0.8, 0.2];
+        // top 30% of 5 = ceil(1.5) = 2 items → sorted desc [0.8, 0.5] → mean = 0.65
+        let result = top_percentile_mean(&vals, 0.30);
+        assert!(
+            (result - 0.65).abs() < 1e-5,
+            "expected 0.65, got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn top_percentile_mean_empty() {
+        assert_eq!(top_percentile_mean(&[], 0.30), 0.0);
+    }
+
+    #[test]
+    fn top_percentile_mean_all_items_when_percentile_is_one() {
+        let vals = vec![0.2f32, 0.4, 0.6];
+        let result = top_percentile_mean(&vals, 1.0);
+        assert!(
+            (result - (0.2 + 0.4 + 0.6) / 3.0).abs() < 1e-5,
+            "got {}",
+            result
+        );
+    }
+
+    #[test]
+    fn app_state_warming_flags_initialize_false() {
+        let state = AppState::new();
+        assert!(
+            !state.parakeet_warming.load(Ordering::Relaxed),
+            "parakeet_warming should start false"
+        );
+        assert!(
+            !state.omni_asr_warming.load(Ordering::Relaxed),
+            "omni_asr_warming should start false"
+        );
+        assert!(
+            !state.cohere_transcribe_warming.load(Ordering::Relaxed),
+            "cohere_transcribe_warming should start false"
+        );
+    }
+
+    #[test]
+    fn parakeet_cache_entry_requires_matching_config() {
+        let now = Instant::now();
+        assert!(!parakeet_cache_entry_is_valid(
+            "model-a::cpu::en",
+            "model-b::cpu::en",
+            now,
+            now,
+        ));
+    }
+
+    #[test]
+    fn parakeet_cache_entry_expires_after_ttl() {
+        let cached_at = Instant::now();
+        let expired_now = cached_at + PARAKEET_WARM_TTL + Duration::from_secs(1);
+        assert!(!parakeet_cache_entry_is_valid(
+            "model-a::cpu::en",
+            "model-a::cpu::en",
+            cached_at,
+            expired_now,
+        ));
+    }
+
+    #[test]
+    fn parakeet_warmup_prefers_sys_then_mic() {
+        assert_eq!(
+            parakeet_warmup_slots(),
+            [ParakeetWorkerSlot::Sys, ParakeetWorkerSlot::Mic]
+        );
+    }
+
+    #[test]
+    fn selected_stt_provider_recognizes_cohere_transcribe() {
+        let mut settings = AppSettings::default();
+        settings.stt_provider = "cohere-transcribe".into();
+        assert_eq!(selected_stt_provider(&settings), "cohere-transcribe");
+    }
+
+    #[test]
+    fn shutdown_gate_allows_only_one_request() {
+        let state = AppState::new();
+        assert!(state.begin_shutdown());
+        assert!(!state.begin_shutdown());
+    }
+
+    #[test]
+    fn app_exit_stop_behavior_disables_warmups_and_awaits_notes() {
+        let behavior = StopBehavior::app_exit();
+        assert!(behavior.await_notes);
+        assert!(!behavior.restart_warmups);
+    }
+
+    #[test]
+    fn preview_notes_behavior_stays_local() {
+        let behavior = NotesGenerationBehavior::preview();
+        assert!(behavior.emit_chunks);
+        assert!(!behavior.persist_notes);
+        assert!(!behavior.publish_to_obsidian);
+        assert!(!behavior.emit_status);
+    }
+
+    #[test]
+    fn persisted_notes_behavior_persists_and_publishes() {
+        let behavior = NotesGenerationBehavior::persisted(false);
+        assert!(!behavior.emit_chunks);
+        assert!(behavior.persist_notes);
+        assert!(behavior.publish_to_obsidian);
+        assert!(behavior.emit_status);
+    }
+}
+
+// ── Prerequisite check commands ──────────────────────────────────────────────
+
+/// Check whether WSL2 is available and has Python 3 inside it.
+/// Returns Ok(message) on success or Err(message) with setup instructions.
+#[tauri::command]
+pub fn check_wsl2() -> Result<String, String> {
+    omni_asr::check_wsl2_available()
+        .map(|_| "WSL2 is available and Python 3 is installed inside it.".to_string())
+}
+
+/// Check whether a native Python 3 is available on the system PATH.
+/// Used by faster-whisper and parakeet on all platforms.
+/// Returns Ok(command) on success or Err(message) with setup instructions.
+#[tauri::command]
+pub fn check_python() -> Result<String, String> {
+    omni_asr::check_native_python_available()
+}

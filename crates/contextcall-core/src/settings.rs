@@ -1,0 +1,860 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum MicCaptureMode {
+    #[default]
+    Auto,
+    PushToTalk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    #[serde(default = "default_model", alias = "selected_model")]
+    pub selected_model: String,
+
+    #[serde(default = "default_locale", alias = "transcription_locale")]
+    pub transcription_locale: String,
+
+    #[serde(default = "default_transcription_model", alias = "transcription_model")]
+    pub transcription_model: String,
+
+    #[serde(default, alias = "input_device_name")]
+    pub input_device_name: Option<String>,
+
+    #[serde(default = "default_whisper_model", alias = "whisper_model")]
+    pub whisper_model: String,
+
+    #[serde(default = "default_stt_provider", alias = "stt_provider")]
+    pub stt_provider: String,
+
+    #[serde(
+        default = "default_faster_whisper_model",
+        alias = "faster_whisper_model"
+    )]
+    pub faster_whisper_model: String,
+
+    #[serde(
+        default = "default_faster_whisper_compute_type",
+        alias = "faster_whisper_compute_type"
+    )]
+    pub faster_whisper_compute_type: String,
+
+    #[serde(
+        default = "default_faster_whisper_device",
+        alias = "faster_whisper_device"
+    )]
+    pub faster_whisper_device: String,
+
+    #[serde(default = "default_parakeet_model", alias = "parakeet_model")]
+    pub parakeet_model: String,
+
+    #[serde(default = "default_parakeet_device", alias = "parakeet_device")]
+    pub parakeet_device: String,
+
+    #[serde(default = "default_omni_asr_model", alias = "omni_asr_model")]
+    pub omni_asr_model: String,
+
+    #[serde(default = "default_omni_asr_device", alias = "omni_asr_device")]
+    pub omni_asr_device: String,
+
+    #[serde(
+        default = "default_cohere_transcribe_model",
+        alias = "cohere_transcribe_model"
+    )]
+    pub cohere_transcribe_model: String,
+
+    #[serde(
+        default = "default_cohere_transcribe_device",
+        alias = "cohere_transcribe_device"
+    )]
+    pub cohere_transcribe_device: String,
+
+    #[serde(default, alias = "system_audio_device_name")]
+    pub system_audio_device_name: Option<String>,
+
+    #[serde(default, alias = "hugging_face_token")]
+    pub hugging_face_token: Option<String>,
+
+    #[serde(default = "default_llm_provider", alias = "llm_provider")]
+    pub llm_provider: String,
+
+    #[serde(default = "default_embedding_provider", alias = "embedding_provider")]
+    pub embedding_provider: String,
+
+    #[serde(default = "default_ollama_url", alias = "ollama_base_url")]
+    pub ollama_base_url: String,
+
+    #[serde(default = "default_ollama_llm_model", alias = "ollama_llm_model")]
+    pub ollama_llm_model: String,
+
+    #[serde(default = "default_ollama_embed_model", alias = "ollama_embed_model")]
+    pub ollama_embed_model: String,
+
+    #[serde(default = "default_openai_llm_url", alias = "open_ai_llm_base_url")]
+    pub open_ai_llm_base_url: String,
+
+    #[serde(default = "default_openai_embed_url", alias = "open_ai_embed_base_url")]
+    pub open_ai_embed_base_url: String,
+
+    #[serde(default = "default_openai_embed_model", alias = "open_ai_embed_model")]
+    pub open_ai_embed_model: String,
+
+    #[serde(default = "default_codex_cli_path", alias = "codex_cli_path")]
+    pub codex_cli_path: String,
+
+    #[serde(default, alias = "codex_cli_model")]
+    pub codex_cli_model: String,
+
+    #[serde(
+        default = "default_codex_cli_fallback_provider",
+        alias = "codex_cli_fallback_provider"
+    )]
+    pub codex_cli_fallback_provider: String,
+
+    #[serde(default = "default_llama_server_port", alias = "llama_server_port")]
+    pub llama_server_port: u16,
+
+    #[serde(
+        default = "default_suggestion_interval_seconds",
+        alias = "suggestion_interval_seconds"
+    )]
+    pub suggestion_interval_seconds: u64,
+
+    #[serde(default = "default_true", alias = "suggestions_enabled")]
+    pub suggestions_enabled: bool,
+
+    #[serde(default, alias = "kb_folder_path")]
+    pub kb_folder_path: Option<String>,
+
+    #[serde(default = "default_notes_folder", alias = "notes_folder_path")]
+    pub notes_folder_path: String,
+
+    #[serde(default, alias = "obsidian_vault_path")]
+    pub obsidian_vault_path: Option<String>,
+
+    #[serde(default, alias = "obsidian_kb_include_paths")]
+    pub obsidian_kb_include_paths: Vec<String>,
+
+    #[serde(
+        default = "default_obsidian_notes_folder",
+        alias = "obsidian_notes_folder"
+    )]
+    pub obsidian_notes_folder: String,
+
+    #[serde(
+        default = "default_obsidian_transcripts_folder",
+        alias = "obsidian_transcripts_folder"
+    )]
+    pub obsidian_transcripts_folder: String,
+
+    #[serde(default, alias = "default_notes_template_id")]
+    pub default_notes_template_id: Option<Uuid>,
+
+    #[serde(default, alias = "has_acknowledged_recording_consent")]
+    pub has_acknowledged_recording_consent: bool,
+
+    #[serde(default = "default_true", alias = "hide_from_screen_share")]
+    pub hide_from_screen_share: bool,
+
+    #[serde(default, alias = "has_completed_onboarding")]
+    pub has_completed_onboarding: bool,
+
+    #[serde(default = "default_kb_surfacing_system_prompt")]
+    pub kb_surfacing_system_prompt: String,
+
+    #[serde(default = "default_suggestion_synthesis_system_prompt")]
+    pub suggestion_synthesis_system_prompt: String,
+
+    #[serde(default = "default_smart_question_system_prompt")]
+    pub smart_question_system_prompt: String,
+
+    #[serde(default = "default_true")]
+    pub diarization_enabled: bool,
+
+    #[serde(default = "default_true", alias = "echo_cancellation_enabled")]
+    pub echo_cancellation_enabled: bool,
+
+    #[serde(default)]
+    pub mic_calibration_rms: Option<f32>,
+
+    #[serde(default = "default_mic_threshold_multiplier")]
+    pub mic_threshold_multiplier: f32,
+
+    #[serde(default, alias = "mic_capture_mode")]
+    pub mic_capture_mode: MicCaptureMode,
+
+    #[serde(default = "default_push_to_talk_hotkey", alias = "push_to_talk_hotkey")]
+    pub push_to_talk_hotkey: String,
+
+    #[serde(default)]
+    pub last_recording_dir: Option<String>,
+}
+
+impl AppSettings {
+    pub fn load() -> Self {
+        Self::load_from(Self::default_path())
+    }
+
+    pub fn save(&self) {
+        self.save_to(Self::default_path());
+    }
+
+    pub fn default_path() -> PathBuf {
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("ContextCall")
+            .join("settings.json")
+    }
+
+    pub fn load_from(path: PathBuf) -> Self {
+        let mut s: Self = if let Ok(data) = std::fs::read_to_string(&path) {
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Self::default()
+        };
+        // Migrate old model names (HuggingFace-style, CTC, unversioned LLM) to
+        // omniASR_LLM_Unlimited_*_v2 card names. The unversioned LLM models use
+        // non-identity size mappings (LLM_300M→1B_v2, LLM_1B→3B_v2) because the
+        // LLM and Unlimited architectures have different capacity profiles at each
+        // parameter count.
+        s.omni_asr_model = match s.omni_asr_model.as_str() {
+            "facebook/omnilingual-asr-300m" | "omnilingual-asr-300m" | "omniASR_CTC_300M" => {
+                "omniASR_LLM_Unlimited_300M_v2"
+            }
+            "facebook/omnilingual-asr-1b"
+            | "omnilingual-asr-1b"
+            | "omniASR_CTC_1B"
+            | "omniASR_LLM_300M" => "omniASR_LLM_Unlimited_1B_v2",
+            "facebook/omnilingual-asr-3b"
+            | "omnilingual-asr-3b"
+            | "omniASR_CTC_3B"
+            | "omniASR_LLM_1B" => "omniASR_LLM_Unlimited_3B_v2",
+            "facebook/omnilingual-asr-7b"
+            | "omnilingual-asr-7b"
+            | "omniASR_LLM_3B"
+            | "omniASR_LLM_7B" => "omniASR_LLM_Unlimited_7B_v2",
+            other => other,
+        }
+        .to_string();
+        s
+    }
+
+    pub fn save_to(&self, path: PathBuf) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    pub fn notes_folder_url(&self) -> PathBuf {
+        PathBuf::from(&self.notes_folder_path)
+    }
+
+    pub fn obsidian_vault_pathbuf(&self) -> Option<PathBuf> {
+        self.obsidian_vault_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            selected_model: default_model(),
+            transcription_locale: default_locale(),
+            transcription_model: default_transcription_model(),
+            input_device_name: None,
+            whisper_model: default_whisper_model(),
+            stt_provider: default_stt_provider(),
+            faster_whisper_model: default_faster_whisper_model(),
+            faster_whisper_compute_type: default_faster_whisper_compute_type(),
+            faster_whisper_device: default_faster_whisper_device(),
+            parakeet_model: default_parakeet_model(),
+            parakeet_device: default_parakeet_device(),
+            omni_asr_model: default_omni_asr_model(),
+            omni_asr_device: default_omni_asr_device(),
+            cohere_transcribe_model: default_cohere_transcribe_model(),
+            cohere_transcribe_device: default_cohere_transcribe_device(),
+            system_audio_device_name: None,
+            hugging_face_token: None,
+            llm_provider: default_llm_provider(),
+            embedding_provider: default_embedding_provider(),
+            ollama_base_url: default_ollama_url(),
+            ollama_llm_model: default_ollama_llm_model(),
+            ollama_embed_model: default_ollama_embed_model(),
+            open_ai_llm_base_url: default_openai_llm_url(),
+            open_ai_embed_base_url: default_openai_embed_url(),
+            open_ai_embed_model: default_openai_embed_model(),
+            codex_cli_path: default_codex_cli_path(),
+            codex_cli_model: String::new(),
+            codex_cli_fallback_provider: default_codex_cli_fallback_provider(),
+            llama_server_port: default_llama_server_port(),
+            suggestion_interval_seconds: default_suggestion_interval_seconds(),
+            suggestions_enabled: default_true(),
+            kb_folder_path: None,
+            notes_folder_path: default_notes_folder(),
+            obsidian_vault_path: None,
+            obsidian_kb_include_paths: Vec::new(),
+            obsidian_notes_folder: default_obsidian_notes_folder(),
+            obsidian_transcripts_folder: default_obsidian_transcripts_folder(),
+            default_notes_template_id: None,
+            has_acknowledged_recording_consent: false,
+            hide_from_screen_share: true,
+            has_completed_onboarding: false,
+            kb_surfacing_system_prompt: default_kb_surfacing_system_prompt(),
+            suggestion_synthesis_system_prompt: default_suggestion_synthesis_system_prompt(),
+            smart_question_system_prompt: default_smart_question_system_prompt(),
+            diarization_enabled: default_true(),
+            echo_cancellation_enabled: default_true(),
+            mic_calibration_rms: None,
+            mic_threshold_multiplier: default_mic_threshold_multiplier(),
+            mic_capture_mode: MicCaptureMode::Auto,
+            push_to_talk_hotkey: default_push_to_talk_hotkey(),
+            last_recording_dir: None,
+        }
+    }
+}
+
+fn default_mic_threshold_multiplier() -> f32 {
+    0.6
+}
+
+fn default_push_to_talk_hotkey() -> String {
+    "Space".into()
+}
+
+fn default_whisper_model() -> String {
+    "auto".into()
+}
+fn default_stt_provider() -> String {
+    "whisper-rs".into()
+}
+fn default_faster_whisper_model() -> String {
+    "base".into()
+}
+fn default_faster_whisper_compute_type() -> String {
+    "default".into()
+}
+fn default_faster_whisper_device() -> String {
+    "auto".into()
+}
+fn default_parakeet_model() -> String {
+    "nvidia/parakeet-tdt-0.6b-v3".into()
+}
+fn default_parakeet_device() -> String {
+    "auto".into()
+}
+fn default_omni_asr_model() -> String {
+    "omniASR_LLM_Unlimited_1B_v2".into()
+}
+fn default_omni_asr_device() -> String {
+    "auto".into()
+}
+fn default_cohere_transcribe_model() -> String {
+    "CohereLabs/cohere-transcribe-03-2026".into()
+}
+fn default_cohere_transcribe_device() -> String {
+    "auto".into()
+}
+fn default_model() -> String {
+    "nvidia/nemotron-3-nano-4b".into()
+}
+fn default_locale() -> String {
+    "auto".into()
+}
+fn default_transcription_model() -> String {
+    "whisper-base".into()
+}
+fn default_llm_provider() -> String {
+    "openai".into()
+}
+fn default_embedding_provider() -> String {
+    "openai".into()
+}
+fn default_ollama_url() -> String {
+    "http://localhost:11434".into()
+}
+fn default_ollama_llm_model() -> String {
+    "qwen3:8b".into()
+}
+fn default_ollama_embed_model() -> String {
+    "nomic-embed-text".into()
+}
+fn default_openai_llm_url() -> String {
+    "http://127.0.0.1:1234".into()
+}
+fn default_openai_embed_url() -> String {
+    "http://127.0.0.1:1234".into()
+}
+fn default_openai_embed_model() -> String {
+    "text-embedding-nomic-embed-text-v1.5".into()
+}
+fn default_codex_cli_path() -> String {
+    "codex".into()
+}
+fn default_codex_cli_fallback_provider() -> String {
+    "disabled".into()
+}
+fn default_llama_server_port() -> u16 {
+    8765
+}
+fn default_suggestion_interval_seconds() -> u64 {
+    30
+}
+fn default_true() -> bool {
+    true
+}
+fn default_kb_surfacing_system_prompt() -> String {
+    "You are a real-time meeting intelligence assistant. Decide whether retrieved knowledge base context is relevant enough to surface as a live suggestion RIGHT NOW.\n\nEvaluate on four dimensions:\n- Relevance: Does the KB content directly address the current topic?\n- Helpfulness: Would it give the participant a concrete advantage in this moment?\n- Timing: Is this the right moment — not too early, not after the window has passed?\n- Novelty: Is this meaningfully different from suggestions already surfaced?\n\nBe selective. Only return shouldSurface=true when the content provides clear, immediate value. Interrupting with a weak suggestion is worse than staying silent.\n\nReturn only valid JSON: {\"shouldSurface\": bool, \"confidence\": 0-1, \"relevanceScore\": 0-1, \"helpfulnessScore\": 0-1, \"timingScore\": 0-1, \"noveltyScore\": 0-1, \"reason\": \"one sentence\"}".into()
+}
+fn default_suggestion_synthesis_system_prompt() -> String {
+    "You are a real-time meeting intelligence assistant. Given the current conversation moment and relevant knowledge, write a concise, actionable suggestion the participant can act on immediately.\n\nGuidelines:\n- Lead with the most useful insight or action — skip background context\n- Be specific and concrete, not generic\n- Write as a direct tip to the participant, not a knowledge summary\n- Match the urgency and tone of the conversation\n- 1-2 sentences maximum\n\nReturn only the suggestion text, no labels or extra formatting.".into()
+}
+fn default_smart_question_system_prompt() -> String {
+    "You are a real-time meeting intelligence assistant. Decide whether the participant should ask a clarifying or probing question right now.\n\nSurface a question when you detect:\n- A knowledge gap: key information is missing or assumed\n- An ambiguity: terms or requirements could be interpreted multiple ways\n- An unstated constraint: decisions are being made without surfacing important limits\n- A missing \"why\": proposals lack rationale that would affect the outcome\n\nDo NOT surface a question when:\n- Conversation is flowing and a question would interrupt momentum\n- A similar question was already asked this session\n- The information gap is minor and unlikely to matter\n\nThe question must be specific, natural, and directly probe the missing information. One crisp sentence.\n\nReturn only valid JSON: {\"shouldSurface\": bool, \"question\": \"the question\", \"confidence\": 0-1, \"relevanceScore\": 0-1, \"helpfulnessScore\": 0-1, \"timingScore\": 0-1, \"noveltyScore\": 0-1, \"reason\": \"one sentence\"}".into()
+}
+fn default_notes_folder() -> String {
+    dirs::document_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ContextCall")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn default_obsidian_notes_folder() -> String {
+    "ContextCall/Meetings".into()
+}
+
+fn default_obsidian_transcripts_folder() -> String {
+    "ContextCall/Transcripts".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn settings_persist_and_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.selected_model = "anthropic/claude-3-haiku".into();
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(s2.selected_model, "anthropic/claude-3-haiku");
+    }
+
+    #[test]
+    fn settings_defaults_when_no_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert_eq!(s.transcription_locale, "auto");
+    }
+
+    #[test]
+    fn whisper_model_defaults_to_base_en() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert_eq!(s.whisper_model, "auto");
+    }
+
+    #[test]
+    fn system_audio_device_name_defaults_to_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert!(s.system_audio_device_name.is_none());
+    }
+
+    #[test]
+    fn hugging_face_token_defaults_to_none_and_roundtrips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let s = AppSettings::load_from(path.clone());
+        assert!(s.hugging_face_token.is_none());
+
+        let mut s2 = AppSettings::load_from(path.clone());
+        s2.hugging_face_token = Some("hf_test_token".into());
+        s2.save_to(path.clone());
+
+        let s3 = AppSettings::load_from(path);
+        assert_eq!(s3.hugging_face_token.as_deref(), Some("hf_test_token"));
+    }
+
+    #[test]
+    fn obsidian_defaults_are_set() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = AppSettings::load_from(path);
+        assert!(settings.obsidian_vault_path.is_none());
+        assert!(settings.obsidian_kb_include_paths.is_empty());
+        assert_eq!(settings.obsidian_notes_folder, "ContextCall/Meetings");
+        assert_eq!(
+            settings.obsidian_transcripts_folder,
+            "ContextCall/Transcripts"
+        );
+        assert!(settings.default_notes_template_id.is_none());
+    }
+
+    #[test]
+    fn openai_compatible_embedding_defaults_use_lm_studio_safe_model() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = AppSettings::load_from(path);
+        assert_eq!(settings.embedding_provider, "openai");
+        assert_eq!(settings.open_ai_embed_base_url, "http://127.0.0.1:1234");
+        assert_eq!(
+            settings.open_ai_embed_model,
+            "text-embedding-nomic-embed-text-v1.5"
+        );
+    }
+
+    #[test]
+    fn codex_cli_defaults_are_conscious_and_keyless() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = AppSettings::load_from(path);
+        assert_eq!(settings.codex_cli_path, "codex");
+        assert_eq!(settings.codex_cli_model, "");
+        assert_eq!(settings.codex_cli_fallback_provider, "disabled");
+    }
+
+    #[test]
+    fn whisper_model_missing_from_json_uses_default() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Write a settings file that doesn't contain whisper_model
+        std::fs::write(&path, r#"{"selectedModel":"test"}"#).unwrap();
+        let s = AppSettings::load_from(path);
+        assert_eq!(s.whisper_model, "auto");
+    }
+
+    #[test]
+    fn whisper_model_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.whisper_model = "base".into();
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(s2.whisper_model, "base");
+    }
+
+    #[test]
+    fn llama_server_port_defaults_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        assert_eq!(s.llama_server_port, 8765);
+        s.llama_server_port = 9123;
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(s2.llama_server_port, 9123);
+    }
+
+    #[test]
+    fn stt_provider_defaults_to_whisper_rs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert_eq!(s.stt_provider, "whisper-rs");
+        assert_eq!(s.faster_whisper_model, "base");
+        assert_eq!(s.faster_whisper_compute_type, "default");
+        assert_eq!(s.faster_whisper_device, "auto");
+    }
+
+    #[test]
+    fn stt_provider_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.stt_provider = "faster-whisper".into();
+        s.faster_whisper_model = "small".into();
+        s.faster_whisper_compute_type = "int8".into();
+        s.faster_whisper_device = "cpu".into();
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(s2.stt_provider, "faster-whisper");
+        assert_eq!(s2.faster_whisper_model, "small");
+        assert_eq!(s2.faster_whisper_compute_type, "int8");
+        assert_eq!(s2.faster_whisper_device, "cpu");
+    }
+
+    #[test]
+    fn parakeet_provider_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert_eq!(s.parakeet_model, "nvidia/parakeet-tdt-0.6b-v3");
+        assert_eq!(s.parakeet_device, "auto");
+    }
+
+    #[test]
+    fn parakeet_provider_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.stt_provider = "parakeet".into();
+        s.parakeet_model = "nvidia/parakeet-tdt-0.6b-v3".into();
+        s.parakeet_device = "cuda".into();
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(s2.stt_provider, "parakeet");
+        assert_eq!(s2.parakeet_model, "nvidia/parakeet-tdt-0.6b-v3");
+        assert_eq!(s2.parakeet_device, "cuda");
+    }
+
+    #[test]
+    fn cohere_transcribe_provider_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert_eq!(
+            s.cohere_transcribe_model,
+            "CohereLabs/cohere-transcribe-03-2026"
+        );
+        assert_eq!(s.cohere_transcribe_device, "auto");
+    }
+
+    #[test]
+    fn cohere_transcribe_provider_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.stt_provider = "cohere-transcribe".into();
+        s.cohere_transcribe_model = "CohereLabs/cohere-transcribe-03-2026".into();
+        s.cohere_transcribe_device = "cuda".into();
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(s2.stt_provider, "cohere-transcribe");
+        assert_eq!(
+            s2.cohere_transcribe_model,
+            "CohereLabs/cohere-transcribe-03-2026"
+        );
+        assert_eq!(s2.cohere_transcribe_device, "cuda");
+    }
+
+    #[test]
+    fn system_audio_device_name_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.system_audio_device_name = Some("Speakers (Realtek)".into());
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(
+            s2.system_audio_device_name.as_deref(),
+            Some("Speakers (Realtek)")
+        );
+    }
+
+    #[test]
+    fn suggestion_interval_defaults_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        assert_eq!(s.suggestion_interval_seconds, 30);
+        s.suggestion_interval_seconds = 180;
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(s2.suggestion_interval_seconds, 180);
+    }
+
+    #[test]
+    fn suggestions_enabled_defaults_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        assert!(s.suggestions_enabled);
+        s.suggestions_enabled = false;
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert!(!s2.suggestions_enabled);
+    }
+
+    #[test]
+    fn diarization_enabled_defaults_to_true() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert!(s.diarization_enabled);
+    }
+
+    #[test]
+    fn diarization_enabled_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.diarization_enabled = false;
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert!(!s2.diarization_enabled);
+    }
+
+    #[test]
+    fn echo_cancellation_enabled_defaults_to_true() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert!(s.echo_cancellation_enabled);
+    }
+
+    #[test]
+    fn echo_cancellation_enabled_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.echo_cancellation_enabled = false;
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert!(!s2.echo_cancellation_enabled);
+    }
+
+    #[test]
+    fn mic_threshold_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert!(
+            s.mic_calibration_rms.is_none(),
+            "mic_calibration_rms should default to None"
+        );
+        assert!(
+            (s.mic_threshold_multiplier - 0.6).abs() < 1e-6,
+            "mic_threshold_multiplier should default to 0.6"
+        );
+    }
+
+    #[test]
+    fn mic_threshold_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.mic_calibration_rms = Some(0.042);
+        s.mic_threshold_multiplier = 0.7;
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert!((s2.mic_calibration_rms.unwrap() - 0.042).abs() < 1e-6);
+        assert!((s2.mic_threshold_multiplier - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mic_threshold_defaults_when_absent_from_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"selectedModel":"gpt-4o"}"#).unwrap();
+        let s = AppSettings::load_from(path);
+        assert!(s.mic_calibration_rms.is_none());
+        assert!((s.mic_threshold_multiplier - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mic_capture_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let s = AppSettings::load_from(path);
+        assert_eq!(s.mic_capture_mode, MicCaptureMode::Auto);
+        assert_eq!(s.push_to_talk_hotkey, "Space");
+    }
+
+    #[test]
+    fn mic_capture_persists_and_reloads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = AppSettings::load_from(path.clone());
+        s.mic_capture_mode = MicCaptureMode::PushToTalk;
+        s.push_to_talk_hotkey = "Ctrl+Shift+Space".into();
+        s.save_to(path.clone());
+        let s2 = AppSettings::load_from(path);
+        assert_eq!(s2.mic_capture_mode, MicCaptureMode::PushToTalk);
+        assert_eq!(s2.push_to_talk_hotkey, "Ctrl+Shift+Space");
+    }
+
+    #[test]
+    fn mic_capture_defaults_when_absent_from_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"selectedModel":"gpt-4o"}"#).unwrap();
+        let s = AppSettings::load_from(path);
+        assert_eq!(s.mic_capture_mode, MicCaptureMode::Auto);
+        assert_eq!(s.push_to_talk_hotkey, "Space");
+    }
+
+    #[test]
+    fn test_last_recording_dir_defaults_to_none_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings_rec_test.json");
+
+        // Default is None
+        let s = AppSettings::load_from(path.clone());
+        assert!(s.last_recording_dir.is_none());
+
+        // Roundtrip
+        let mut s2 = AppSettings::load_from(path.clone());
+        s2.last_recording_dir = Some("/tmp/recordings".to_string());
+        s2.save_to(path.clone());
+
+        let s3 = AppSettings::load_from(path);
+        assert_eq!(s3.last_recording_dir, Some("/tmp/recordings".to_string()));
+    }
+
+    #[test]
+    fn omni_asr_model_migrates_to_v2() {
+        let cases: &[(&str, &str)] = &[
+            // Legacy HuggingFace-style names
+            (
+                "facebook/omnilingual-asr-300m",
+                "omniASR_LLM_Unlimited_300M_v2",
+            ),
+            ("omnilingual-asr-300m", "omniASR_LLM_Unlimited_300M_v2"),
+            ("facebook/omnilingual-asr-1b", "omniASR_LLM_Unlimited_1B_v2"),
+            ("omnilingual-asr-1b", "omniASR_LLM_Unlimited_1B_v2"),
+            ("facebook/omnilingual-asr-3b", "omniASR_LLM_Unlimited_3B_v2"),
+            ("omnilingual-asr-3b", "omniASR_LLM_Unlimited_3B_v2"),
+            ("facebook/omnilingual-asr-7b", "omniASR_LLM_Unlimited_7B_v2"),
+            ("omnilingual-asr-7b", "omniASR_LLM_Unlimited_7B_v2"),
+            // Old CTC names
+            ("omniASR_CTC_300M", "omniASR_LLM_Unlimited_300M_v2"),
+            ("omniASR_CTC_1B", "omniASR_LLM_Unlimited_1B_v2"),
+            ("omniASR_CTC_3B", "omniASR_LLM_Unlimited_3B_v2"),
+            // Old unversioned LLM names
+            ("omniASR_LLM_300M", "omniASR_LLM_Unlimited_1B_v2"),
+            ("omniASR_LLM_1B", "omniASR_LLM_Unlimited_3B_v2"),
+            ("omniASR_LLM_3B", "omniASR_LLM_Unlimited_7B_v2"),
+            ("omniASR_LLM_7B", "omniASR_LLM_Unlimited_7B_v2"),
+            // v2 Unlimited names pass through unchanged
+            (
+                "omniASR_LLM_Unlimited_300M_v2",
+                "omniASR_LLM_Unlimited_300M_v2",
+            ),
+            ("omniASR_LLM_Unlimited_1B_v2", "omniASR_LLM_Unlimited_1B_v2"),
+            ("omniASR_LLM_Unlimited_3B_v2", "omniASR_LLM_Unlimited_3B_v2"),
+            ("omniASR_LLM_Unlimited_7B_v2", "omniASR_LLM_Unlimited_7B_v2"),
+            // Unknown/custom names pass through unchanged
+            ("my_custom_asr_model", "my_custom_asr_model"),
+        ];
+
+        for (old, expected) in cases {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            std::fs::write(&path, format!(r#"{{"omniAsrModel": "{}"}}"#, old)).unwrap();
+            let s = AppSettings::load_from(path);
+            assert_eq!(
+                s.omni_asr_model, *expected,
+                "expected '{}' to migrate to '{}', got '{}'",
+                old, expected, s.omni_asr_model
+            );
+        }
+    }
+}
