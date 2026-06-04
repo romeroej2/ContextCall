@@ -10,7 +10,7 @@ $repoUrls = @(
 $repoCommit = "b202069aa891d8243206f89599c04f0e8e6a3d27"
 $registryWhisperVersion = "0.14.4"
 $registryWhisperSysVersion = "0.13.1"
-$cacheStamp = Join-Path $whisperRoot ".openoats-patched-commit"
+$cacheStamp = Join-Path $whisperRoot ".contextcall-patched-commit"
 
 function Remove-WhisperRoot {
   if (Test-Path $whisperRoot) {

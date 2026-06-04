@@ -335,7 +335,7 @@ fn default_whisper_model() -> String {
     "auto".into()
 }
 fn default_stt_provider() -> String {
-    "whisper-rs".into()
+    "llama-server".into()
 }
 fn default_faster_whisper_model() -> String {
     "base".into()
@@ -564,11 +564,11 @@ mod tests {
     }
 
     #[test]
-    fn stt_provider_defaults_to_whisper_rs() {
+    fn stt_provider_defaults_to_llama_server() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
         let s = AppSettings::load_from(path);
-        assert_eq!(s.stt_provider, "whisper-rs");
+        assert_eq!(s.stt_provider, "llama-server");
         assert_eq!(s.faster_whisper_model, "base");
         assert_eq!(s.faster_whisper_compute_type, "default");
         assert_eq!(s.faster_whisper_device, "auto");

@@ -94,6 +94,7 @@ function sttProviderLabel(provider: string): string {
   if (provider === "parakeet") return "parakeet";
   if (provider === "omni-asr") return "omni-asr";
   if (provider === "cohere-transcribe") return "cohere-transcribe";
+  if (provider === "llama-server") return "Gemma 4 (llama-server)";
   return "whisper-rs";
 }
 
@@ -589,7 +590,7 @@ function App() {
             Transcription Setup Required
           </h3>
           <p style={{ color: colors.textSecondary, fontSize: 13, margin: "0 0 20px", lineHeight: 1.5 }}>
-            {sttStatus?.message || `ContextCall needs ${sttProviderLabel(settings?.sttProvider || "whisper-rs")} to be ready before transcription can start.`}
+            {sttStatus?.message || `ContextCall needs ${sttProviderLabel(settings?.sttProvider || "llama-server")} to be ready before transcription can start.`}
           </p>
             {modelError && (
               <p style={{ color: colors.error, fontSize: 12, margin: "0 0 16px", lineHeight: 1.5 }}>
@@ -619,8 +620,8 @@ function App() {
               </div>
             )}
             <button onClick={handleDownload} style={primaryBtn}>
-              {settings?.sttProvider && settings.sttProvider !== "whisper-rs"
-                ? `Set up ${sttProviderLabel(settings.sttProvider)}`
+              {(settings?.sttProvider || "llama-server") !== "whisper-rs"
+                ? `Set up ${sttProviderLabel(settings?.sttProvider || "llama-server")}`
                 : `Download ${activeWhisperModel} (~150 MB)`}
             </button>
           <button
@@ -643,7 +644,7 @@ function App() {
   }
 
   if (modelState === "downloading") {
-    const isModelStage = sttSetupStage === "model" || settings?.sttProvider === "whisper-rs" || !settings?.sttProvider;
+    const isModelStage = sttSetupStage === "model" || settings?.sttProvider === "whisper-rs";
     
     return (
       <div style={centerStyle}>
@@ -663,8 +664,8 @@ function App() {
           )}
           
           <p style={{ color: colors.textSecondary, fontSize: 12, margin: 0 }}>
-            {settings?.sttProvider && settings.sttProvider !== "whisper-rs"
-              ? `Preparing ${sttProviderLabel(settings.sttProvider)}... ${isModelStage ? `${downloadProgress}%` : ''}`
+            {(settings?.sttProvider || "llama-server") !== "whisper-rs"
+              ? `Preparing ${sttProviderLabel(settings?.sttProvider || "llama-server")}... ${isModelStage ? `${downloadProgress}%` : ''}`
               : `Downloading ${activeWhisperModel}... ${isModelStage ? `${downloadProgress}%` : ''}`}
           </p>
           {sttSetupMessage && (

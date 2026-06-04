@@ -52,7 +52,13 @@ const whisperModelOptions = [
 ];
 
 const sttProviderOptions = [
-  { value: "whisper-rs", label: "whisper-rs", description: "Current in-process local transcription with ggml Whisper models. No extra dependencies required." },
+  {
+    value: "llama-server",
+    label: "Gemma 4 12B (llama-server)",
+    description:
+      "Default. Local Gemma 4 12B multimodal audio transcription via a bundled llama.cpp server. No Python required - one-click setup downloads everything (~7.6 GB) and reuses LM Studio models when found. The same server also powers the local AI agent.",
+  },
+  { value: "whisper-rs", label: "whisper-rs", description: "In-process local transcription with ggml Whisper models. No extra dependencies required." },
   { value: "faster-whisper", label: "faster-whisper", description: "Worker-based backend with app-managed Python runtime. Requires Python 3 on your system." },
   { value: "parakeet", label: "parakeet", description: "NVIDIA Parakeet TDT v3 — multilingual, 25 languages, automatic language detection. Requires Python 3 and ~3 GB disk." },
   { value: "omni-asr", label: "Omni-ASR", description: "facebookresearch/omnilingual-asr — supports 1,600+ languages. Requires Python 3 (Linux/macOS) or WSL2 + Python 3 (Windows)." },
@@ -65,12 +71,6 @@ sttProviderOptions.push({
     "Local CohereLabs/cohere-transcribe-03-2026 via Transformers. Requires Python 3, a Hugging Face token, and a supported explicit locale.",
 });
 
-sttProviderOptions.push({
-  value: "llama-server",
-  label: "Gemma 4 12B (llama-server)",
-  description:
-    "Local Gemma 4 12B multimodal audio transcription via a bundled llama.cpp server. No Python required - one-click setup downloads everything (~7.6 GB) and reuses LM Studio models when found. The same server also powers the local AI agent.",
-});
 
 const parakeetModelOptions = [
   { value: "nvidia/parakeet-tdt-0.6b-v3", label: "Parakeet TDT 0.6B v3 (Recommended)", description: "600M params, 25 languages, best speed/accuracy balance." },

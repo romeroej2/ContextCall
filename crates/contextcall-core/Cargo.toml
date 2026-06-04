@@ -7,7 +7,9 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
-keyring = "3"
+# keyring: platform backend features are target-gated below (a single shared
+# `keyring = "3"` would compile the non-persistent mock store). Do NOT add a
+# featureless keyring here — it would pull the dbus backend onto macOS/Windows.
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
@@ -30,6 +32,16 @@ sysinfo = "0.30"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Persistent OS credential store per platform (keyring v3 backends are opt-in).
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"
