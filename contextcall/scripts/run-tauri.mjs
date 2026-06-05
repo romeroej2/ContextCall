@@ -61,7 +61,11 @@ async function main() {
   try {
     exitCode = await run(tauriCommand[0], tauriCommand[1]);
   } finally {
-    if (isBuild) {
+    // Cleanup removes .build/whisper-rs so `tauri build` (CI/bundle) leaves no
+    // checkout behind. Skip it when CONTEXTCALL_KEEP_WHISPER is set (local
+    // iterative builds via dev.ps1): keeping the patched source lets cargo
+    // cache the compiled whisper.cpp instead of rebuilding it every run.
+    if (isBuild && !process.env.CONTEXTCALL_KEEP_WHISPER) {
       await run(powershell, cleanupArgs);
     }
   }

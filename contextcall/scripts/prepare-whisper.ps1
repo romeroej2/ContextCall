@@ -18,6 +18,16 @@ function Remove-WhisperRoot {
   }
 }
 
+# Write only when content actually differs. Re-running prepare with identical
+# patched content must not bump the file mtime: cargo keys whisper-rs-sys
+# rebuilds off build.rs/source mtimes, so an unconditional Set-Content forces a
+# full whisper.cpp recompile on every build.
+function Set-IfChanged([string]$path, [string]$text) {
+  if (-not (Test-Path $path) -or ((Get-Content $path -Raw) -ne $text)) {
+    Set-Content -Path $path -Value $text -NoNewline
+  }
+}
+
 function Get-CargoHome {
   if ($env:CARGO_HOME) {
     return $env:CARGO_HOME
@@ -170,7 +180,7 @@ $buildText = $buildText.Replace(
   '    let destination = config.build();',
   '    if target.contains("apple") { config.cflag("-U__ARM_FEATURE_MATMUL_INT8"); config.cxxflag("-U__ARM_FEATURE_MATMUL_INT8"); }' + "`n" + '    let destination = config.build();'
 )
-Set-Content -Path $sysBuild -Value $buildText -NoNewline
+Set-IfChanged $sysBuild $buildText
 
 $bindingsText = Get-Content $sysBindings -Raw
 $bindingsText = [regex]::Replace(
@@ -214,14 +224,14 @@ $bindingsText = [regex]::Replace(
   '(?s)pub unsafe fn set__flags2_raw\(this: \*mut Self, val: ::std::os::raw::c_int\) \{\s*unsafe \{\s*let val: u32 = ::std::mem::transmute\(val\);\s*<__BindgenBitfieldUnit<\[u8; 3usize\]>>::raw_set\(\s*::std::ptr::addr_of_mut!\(\(\*this\)\._bitfield_1\),\s*0usize,\s*24u8,\s*val as u64,\s*\)\s*\}\s*\}',
   "pub unsafe fn set__flags2_raw(this: *mut Self, val: ::std::os::raw::c_int) {`r`n        let val = val as u32;`r`n        <__BindgenBitfieldUnit<[u8; 3usize]>>::raw_set(`r`n            ::std::ptr::addr_of_mut!((*this)._bitfield_1),`r`n            0usize,`r`n            24u8,`r`n            val as u64,`r`n        )`r`n    }"
 )
-Set-Content -Path $sysBindings -Value $bindingsText -NoNewline
+Set-IfChanged $sysBindings $bindingsText
 
 $commonLoggingText = Get-Content $commonLogging -Raw
 $commonLoggingText = $commonLoggingText.Replace("repr(i32)", "repr(u32)")
-Set-Content -Path $commonLogging -Value $commonLoggingText -NoNewline
+Set-IfChanged $commonLogging $commonLoggingText
 
 $grammarText = Get-Content $grammar -Raw
 $grammarText = $grammarText.Replace("repr(i32)", "repr(u32)")
-Set-Content -Path $grammar -Value $grammarText -NoNewline
+Set-IfChanged $grammar $grammarText
 
-Set-Content -Path $cacheStamp -Value $repoCommit -NoNewline
+Set-IfChanged $cacheStamp $repoCommit
