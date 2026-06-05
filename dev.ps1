@@ -124,6 +124,10 @@ if (-not $SkipBuild) {
         # Call run-tauri.mjs directly: it forwards argv verbatim to the Tauri CLI
         # and runs the whisper prepare/cleanup hooks. Going through `npm run`
         # mangles the extra flags (--debug/--no-bundle get dropped).
+        #
+        # Keep the patched .build/whisper-rs checkout after the build so cargo can
+        # cache the compiled whisper.cpp on the next run instead of rebuilding it.
+        $env:CONTEXTCALL_KEEP_WHISPER = "1"
         $buildArgs = @("./scripts/run-tauri.mjs", "build", "--no-bundle")
         if ($Debug) { $buildArgs += "--debug" }
         node @buildArgs
