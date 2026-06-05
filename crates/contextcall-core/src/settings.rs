@@ -857,4 +857,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn first_call_defaults_are_local_first() {
+        // US0031: a fresh install must be usable without opening settings —
+        // local-first providers, auto-selected devices, no cloud keys required.
+        let dir = tempdir().unwrap();
+        let s = AppSettings::load_from(dir.path().join("nonexistent.json"));
+        // Devices unset -> UI resolves to the platform default.
+        assert!(s.input_device_name.is_none());
+        assert!(s.system_audio_device_name.is_none());
+        // STT runs locally by default.
+        assert_eq!(s.stt_provider, "llama-server");
+        // LLM + embeddings point at a local endpoint by default (no cloud egress).
+        assert!(
+            s.open_ai_llm_base_url.starts_with("http://127.0.0.1")
+                || s.open_ai_llm_base_url.starts_with("http://localhost")
+        );
+        assert!(
+            s.open_ai_embed_base_url.starts_with("http://127.0.0.1")
+                || s.open_ai_embed_base_url.starts_with("http://localhost")
+        );
+        // No cloud credentials required out of the box.
+        assert!(s.hugging_face_token.is_none());
+        // Fresh install has not completed onboarding (drives US0033 first-run flow).
+        assert!(!s.has_completed_onboarding);
+    }
 }

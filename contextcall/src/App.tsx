@@ -12,6 +12,7 @@ import { CaptureCapsuleContainer } from "./components/CaptureCapsuleContainer";
 import { SaveRecordingModal } from "./components/SaveRecordingModal";
 import { NotesView } from "./components/NotesView";
 import { SettingsView } from "./components/SettingsView";
+import { FirstRunOnboarding } from "./components/FirstRunOnboarding";
 import { AboutView } from "./components/AboutView";
 import { CompanionShell, type DrawerKey } from "./components/CompanionShell";
 import { SessionHistoryPanel } from "./components/SessionHistoryPanel";
@@ -137,6 +138,7 @@ function App() {
   const [currentSessionId, setCurrentSessionId] = useState<string | undefined>();
   const [currentSessionNotes, setCurrentSessionNotes] = useState<EnhancedNotes | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const [sttStatus, setSttStatus] = useState<SttStatus | null>(null);
   const [isSettingUpStt, setIsSettingUpStt] = useState(false);
   const [sttSetupMessage, setSttSetupMessage] = useState("");
@@ -240,7 +242,10 @@ function App() {
   // Load settings on mount
   useEffect(() => {
     invoke<AppSettings>("get_settings")
-      .then(setSettings)
+      .then((loaded) => {
+        setSettings(loaded);
+        setShowOnboarding(!loaded.hasCompletedOnboarding);
+      })
       .catch(console.error);
   }, []);
 
@@ -252,6 +257,16 @@ function App() {
 
   const handleSettingsChange = useCallback((updated: AppSettings) => {
     setSettings(updated);
+  }, []);
+
+  const handleOnboardingFinish = useCallback(async (updated: AppSettings) => {
+    setSettings(updated);
+    setShowOnboarding(false);
+    try {
+      await invoke("save_settings", { newSettings: updated });
+    } catch (err) {
+      console.error("Failed to save onboarding settings:", err);
+    }
   }, []);
 
   const handleSuggestionSettingsChange = useCallback(
@@ -741,6 +756,16 @@ function App() {
     minHeight: 0,
     flexDirection: "column",
   });
+
+  if (settings && showOnboarding) {
+    return (
+      <FirstRunOnboarding
+        settings={settings}
+        onComplete={handleOnboardingFinish}
+        onSkip={handleOnboardingFinish}
+      />
+    );
+  }
 
   return (
     <CompanionShell
