@@ -75,6 +75,9 @@ export interface AppSettings {
   kbSurfacingSystemPrompt: string;
   suggestionSynthesisSystemPrompt: string;
   smartQuestionSystemPrompt: string;
+  anthropicApiBaseUrl: string;
+  anthropicApiAuthMode: string;
+  anthropicApiModel: string;
 }
 
 export interface ApiKeys {
@@ -83,6 +86,7 @@ export interface ApiKeys {
   openAiLlmApiKey: string;
   openAiEmbedApiKey: string;
   huggingFaceToken: string;
+  anthropicApiKey: string;
 }
 
 export interface CodexUsageSummary {

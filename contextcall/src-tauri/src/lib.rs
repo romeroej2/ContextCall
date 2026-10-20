@@ -22,6 +22,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             engine::check_model,
             engine::check_codex_cli,
+            engine::check_anthropic_api,
             engine::get_codex_usage_summary,
             engine::get_model_path,
             engine::get_stt_status,

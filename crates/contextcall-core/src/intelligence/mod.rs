@@ -1,4 +1,6 @@
+pub mod anthropic_client;
 pub mod codex_client;
+pub mod conversation;
 pub mod embedding_client;
 pub mod knowledge_base;
 pub mod llm_client;

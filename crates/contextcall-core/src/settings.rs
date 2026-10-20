@@ -192,6 +192,17 @@ pub struct AppSettings {
 
     #[serde(default)]
     pub last_recording_dir: Option<String>,
+
+    // Anthropic Messages API (llm_provider == "anthropic-api"). The key lives in the keychain.
+    #[serde(default = "default_anthropic_api_base_url")]
+    pub anthropic_api_base_url: String,
+
+    /// "x-api-key" (default) or "bearer".
+    #[serde(default = "default_anthropic_api_auth_mode")]
+    pub anthropic_api_auth_mode: String,
+
+    #[serde(default = "default_anthropic_api_model")]
+    pub anthropic_api_model: String,
 }
 
 impl AppSettings {
@@ -319,8 +330,23 @@ impl Default for AppSettings {
             mic_capture_mode: MicCaptureMode::Auto,
             push_to_talk_hotkey: default_push_to_talk_hotkey(),
             last_recording_dir: None,
+            anthropic_api_base_url: default_anthropic_api_base_url(),
+            anthropic_api_auth_mode: default_anthropic_api_auth_mode(),
+            anthropic_api_model: default_anthropic_api_model(),
         }
     }
+}
+
+fn default_anthropic_api_base_url() -> String {
+    "https://api.anthropic.com".into()
+}
+
+fn default_anthropic_api_auth_mode() -> String {
+    "x-api-key".into()
+}
+
+fn default_anthropic_api_model() -> String {
+    "claude-sonnet-5-5".into()
 }
 
 fn default_mic_threshold_multiplier() -> f32 {
