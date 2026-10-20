@@ -15,7 +15,9 @@ use contextcall_core::{
     },
     download,
     intelligence::{
+        claude_client::{self, ClaudeCliConfig, ClaudeCliSession},
         codex_client::{self, CodexCliConfig, CodexTokenUsage},
+        conversation::ContentBlock,
         embedding_client,
         knowledge_base::{KbChunk, KnowledgeBase},
         llm_client::{strip_fences, Message},
@@ -35,6 +37,7 @@ use contextcall_core::{
     transcription::{
         cohere_transcribe::{self, CohereTranscribeConfig},
         faster_whisper::{self, FasterWhisperConfig},
+        fluid_audio::{self, FluidAudioConfig},
         omni_asr::{self, OmniAsrConfig},
         parakeet::{self, ParakeetConfig, ParakeetWorker},
         streaming_transcriber::{SegmentProgress, StreamingTranscriber, SttBackend},
@@ -401,6 +404,8 @@ pub struct AppState {
     /// Holds the active audio recorder when the user opted in before the session.
     /// Populated by start_transcription, cleared by discard_recording_files.
     pub audio_recorder: Mutex<Option<std::sync::Arc<AudioRecorder>>>,
+    /// Interview copilot for the current recording session (interview mode only).
+    pub interview: Mutex<Option<Arc<crate::interview::InterviewRuntime>>>,
 }
 
 impl AppState {
@@ -434,6 +439,7 @@ impl AppState {
             audio_task: Mutex::new(None),
             system_audio_task: Mutex::new(None),
             suggestion_task: Mutex::new(None),
+            interview: Mutex::new(None),
             poll_task: Mutex::new(None),
             overlay_suggestion: Mutex::new(None),
             is_running: Mutex::new(false),
@@ -600,6 +606,37 @@ impl AppState {
                 String::new()
             },
         }
+    }
+
+    pub fn fluid_audio_config(settings: &AppSettings) -> FluidAudioConfig {
+        FluidAudioConfig {
+            helper_path: FluidAudioConfig::default_helper_path(),
+            runtime_root: Self::persistent_data_dir().join("stt").join("fluidaudio"),
+            model: match settings.fluid_audio_model.trim() {
+                "ultra" => "ultra".into(),
+                "v2" => "v2".into(),
+                _ => fluid_audio::DEFAULT_MODEL.into(),
+            },
+            // "es-MX" -> "es"; "auto" leaves v3's per-segment language detection on.
+            language: settings
+                .transcription_locale
+                .split('-')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            diarization_enabled: settings.diarization_enabled,
+        }
+    }
+
+    /// Speaker-embedding sidecar for engines without their own diarization. Only
+    /// offered once its models are set up, so a session never blocks on a download.
+    fn speaker_tagger_config(settings: &AppSettings) -> Option<FluidAudioConfig> {
+        let config = Self::fluid_audio_config(settings);
+        (settings.diarization_enabled
+            && fluid_audio::supported()
+            && config.helper_available()
+            && config.diarizer_ready())
+        .then_some(config)
     }
 }
 
@@ -1340,6 +1377,12 @@ async fn stop_transcription_inner(
     if let Some(handle) = poll_handle {
         handle.abort();
     }
+    let interview = state.interview.lock().unwrap().take();
+    if let Some(interview) = interview {
+        interview.shutdown().await;
+        crate::interview::status_stopped(app, &settings);
+    }
+    reset_claude_live_session().await;
     state.session_store.lock().unwrap().end_session();
     state.transcript_logger.lock().unwrap().end_session();
     *state.overlay_suggestion.lock().unwrap() = None;
@@ -1453,6 +1496,7 @@ fn selected_stt_provider(settings: &AppSettings) -> &str {
         "omni-asr" => "omni-asr",
         "cohere-transcribe" => "cohere-transcribe",
         "llama-server" => "llama-server",
+        "fluidaudio" if fluid_audio::supported() => "fluidaudio",
         _ => "whisper-rs",
     }
 }
@@ -1718,6 +1762,66 @@ fn resolve_stt_status(app: &AppHandle, settings: &AppSettings) -> SttStatusPaylo
         };
     }
 
+    if selected_provider == "fluidaudio" {
+        let config = AppState::fluid_audio_config(settings);
+        let model_label = format!("parakeet-tdt-{}", config.model);
+        let helper_ok = config.helper_available();
+        let selected_ready = helper_ok && config.model_ready();
+
+        if selected_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "fluidaudio".into(),
+                selected_model: model_label.clone(),
+                effective_model: model_label.clone(),
+                selected_provider_ready: true,
+                ready: true,
+                using_fallback: false,
+                download_required: false,
+                message: format!("Parakeet ({model_label}) on the Apple Neural Engine is ready."),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+
+        let setup_message = if helper_ok {
+            "Parakeet (FluidAudio) needs a one-time model download (~470 MB).".to_string()
+        } else {
+            "The FluidAudio helper is missing from this build.".to_string()
+        };
+        if whisper_ready {
+            return SttStatusPayload {
+                selected_provider,
+                effective_provider: "whisper-rs".into(),
+                selected_model: model_label,
+                effective_model: whisper_model,
+                selected_provider_ready: false,
+                ready: true,
+                using_fallback: true,
+                download_required: helper_ok,
+                message: format!("{setup_message} Falling back to whisper-rs."),
+                parakeet_warming: false,
+                omni_asr_warming: false,
+                cohere_transcribe_warming: false,
+            };
+        }
+        return SttStatusPayload {
+            selected_provider,
+            effective_provider: "fluidaudio".into(),
+            selected_model: model_label.clone(),
+            effective_model: model_label,
+            selected_provider_ready: false,
+            ready: false,
+            using_fallback: false,
+            download_required: helper_ok,
+            message: setup_message,
+            parakeet_warming: false,
+            omni_asr_warming: false,
+            cohere_transcribe_warming: false,
+        };
+    }
+
     if selected_provider == "llama-server" {
         let assets = llama_server::assets_status();
         let model_label = llama_server::MODEL_NAME.to_string();
@@ -1820,6 +1924,8 @@ fn resolve_stt_backend(
         SttBackend::LlamaServer {
             base_url: llama_server::base_url(settings.llama_server_port),
         }
+    } else if status.effective_provider == "fluidaudio" {
+        SttBackend::FluidAudio(AppState::fluid_audio_config(settings))
     } else {
         let model_path = AppState::whisper_model_path_for(app, &status.effective_model)?
             .to_string_lossy()
@@ -1884,6 +1990,7 @@ struct HttpLlmConfig {
 enum ResolvedLlmProvider {
     Http(HttpLlmConfig),
     CodexCli,
+    ClaudeCli,
 }
 
 fn http_llm_config_for_provider(settings: &AppSettings, provider: &str) -> HttpLlmConfig {
@@ -1931,6 +2038,8 @@ impl From<(String, Option<String>, String)> for HttpLlmConfig {
 fn resolve_llm_provider(settings: &AppSettings) -> ResolvedLlmProvider {
     if settings.llm_provider == "codex-cli" {
         ResolvedLlmProvider::CodexCli
+    } else if settings.llm_provider == "claude-cli" {
+        ResolvedLlmProvider::ClaudeCli
     } else {
         ResolvedLlmProvider::Http(http_llm_config_for_provider(
             settings,
@@ -2145,6 +2254,9 @@ async fn complete_with_settings(
 ) -> Result<String, String> {
     ensure_llama_for_provider(settings, &settings.llm_provider).await?;
     match resolve_llm_provider(settings) {
+        ResolvedLlmProvider::ClaudeCli => {
+            complete_with_claude_cli(settings, messages, request_kind).await
+        }
         ResolvedLlmProvider::Http(config) => {
             let result = complete_with_http_provider(config, messages, max_tokens).await;
             if settings.llm_provider == "llama-server" {
@@ -2255,6 +2367,126 @@ async fn complete_with_settings(
             }
         }
     }
+}
+
+fn claude_cli_config(settings: &AppSettings, system_prompt: &str) -> ClaudeCliConfig {
+    ClaudeCliConfig {
+        command_path: settings.claude_cli_path.clone(),
+        model: settings.claude_cli_model.clone(),
+        system_prompt: system_prompt.to_string(),
+        working_dir: claude_workspace_dir(),
+        thinking: false,
+        effort: None,
+        web_search: false,
+    }
+}
+
+pub(crate) fn claude_workspace_dir() -> PathBuf {
+    AppState::persistent_data_dir().join("claude-workspace")
+}
+
+const CLAUDE_LIVE_SYSTEM_PROMPT: &str = "You are the LLM backend for ContextCall, a live meeting assistant. \
+Each message carries role-tagged instructions and the latest transcript; follow the instructions in the message exactly \
+(including JSON-only output when asked). Earlier messages in this conversation are the same meeting, so use them \
+to avoid repeating suggestions and to understand follow-ups.";
+
+/// One warm Claude conversation per recording session for live suggestions, so
+/// each check builds on the previous ones instead of starting from zero.
+static CLAUDE_LIVE_SESSION: std::sync::OnceLock<AsyncMutex<Option<Arc<ClaudeCliSession>>>> =
+    std::sync::OnceLock::new();
+
+fn claude_live_slot() -> &'static AsyncMutex<Option<Arc<ClaudeCliSession>>> {
+    CLAUDE_LIVE_SESSION.get_or_init(|| AsyncMutex::new(None))
+}
+
+async fn claude_live_session(settings: &AppSettings) -> Result<Arc<ClaudeCliSession>, String> {
+    let mut slot = claude_live_slot().lock().await;
+    if let Some(session) = slot.as_ref().filter(|session| session.is_alive()) {
+        return Ok(Arc::clone(session));
+    }
+    let session = Arc::new(
+        ClaudeCliSession::spawn(&claude_cli_config(settings, CLAUDE_LIVE_SYSTEM_PROMPT)).await?,
+    );
+    *slot = Some(Arc::clone(&session));
+    Ok(session)
+}
+
+async fn reset_claude_live_session() {
+    if let Some(slot) = CLAUDE_LIVE_SESSION.get() {
+        slot.lock().await.take();
+    }
+}
+
+async fn complete_with_claude_cli(
+    settings: &AppSettings,
+    messages: Vec<Message>,
+    request_kind: LlmRequestKind,
+) -> Result<String, String> {
+    let hint = "Check that Claude Code is installed and signed in (run `claude` once in a terminal).";
+    let result = match request_kind {
+        LlmRequestKind::LiveSuggestion => {
+            let session = claude_live_session(settings).await?;
+            claude_client::complete_turn(
+                session.as_ref(),
+                vec![ContentBlock::text(claude_client::messages_as_turn(&messages))],
+                Duration::from_secs(60),
+            )
+            .await
+        }
+        _ => {
+            let config = claude_cli_config(
+                settings,
+                "You are the LLM backend for ContextCall meeting intelligence. Follow the instructions in the message exactly.",
+            );
+            claude_client::complete(&config, &messages, Duration::from_secs(180)).await
+        }
+    };
+    result.map_err(|err| format!("{err}. {hint}"))
+}
+
+/// Notes/summaries through a one-off Claude CLI process, streaming text as it arrives.
+async fn stream_notes_with_claude_cli(
+    settings: &AppSettings,
+    messages: Vec<Message>,
+    on_chunk: impl Fn(String),
+) -> Result<String, String> {
+    use contextcall_core::intelligence::conversation::{ConversationSession, TurnEvent};
+    let config = claude_cli_config(
+        settings,
+        "You are the LLM backend for ContextCall meeting intelligence. Follow the instructions in the message exactly.",
+    );
+    let session = ClaudeCliSession::spawn(&config).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let send = session.send_turn(
+        vec![ContentBlock::text(claude_client::messages_as_turn(&messages))],
+        tx,
+    );
+    let collect = async {
+        let mut streamed = String::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                TurnEvent::TextDelta(text) => {
+                    streamed.push_str(&text);
+                    on_chunk(text);
+                }
+                TurnEvent::Done { text, .. } => {
+                    return Ok(if text.trim().is_empty() { streamed } else { text });
+                }
+                TurnEvent::Error(err) => return Err(err),
+            }
+        }
+        Err("Claude CLI returned no notes".to_string())
+    };
+    let result = tokio::time::timeout(Duration::from_secs(300), async {
+        let (sent, notes) = tokio::join!(send, collect);
+        sent?;
+        notes
+    })
+    .await
+    .map_err(|_| "Claude CLI timed out while writing notes".to_string())?;
+    result
+        .map(|text| text.trim().to_string())
+        .map_err(|err| format!("{err}. Check that Claude Code is installed and signed in (run `claude` once in a terminal)."))
 }
 
 fn embed_config(settings: &AppSettings) -> (String, Option<String>, String) {
@@ -2647,6 +2879,147 @@ pub fn get_stt_status(
     Ok(status)
 }
 
+fn start_interview_if_enabled(app: &AppHandle, state: &Arc<AppState>, settings: &AppSettings) {
+    if !settings.interview_mode_enabled {
+        return;
+    }
+    // A copilot started on demand (a question typed before recording) is already warm: keep it.
+    if state.interview.lock().unwrap().is_some() {
+        return;
+    }
+    let app = app.clone();
+    let state = Arc::clone(state);
+    let settings = settings.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::interview::InterviewRuntime::start(app.clone(), settings.clone(), claude_workspace_dir()).await {
+            Ok(runtime) => {
+                if *state.is_running.lock().unwrap() {
+                    *state.interview.lock().unwrap() = Some(runtime);
+                } else {
+                    runtime.shutdown().await;
+                }
+            }
+            Err(err) => {
+                log::error!("interview copilot failed to start: {err}");
+                let _ = app.emit(
+                    crate::interview::STATUS_EVENT,
+                    &crate::interview::StatusPayload {
+                        state: "error",
+                        message: err,
+                        fast_model: settings.interview_fast_model.clone(),
+                        deep_model: None,
+                    },
+                );
+            }
+        }
+    });
+}
+
+fn forward_to_interview(state: &AppState, utterance: &contextcall_core::models::Utterance) {
+    let runtime = state.interview.lock().unwrap().clone();
+    if let Some(runtime) = runtime {
+        runtime.on_utterance(utterance);
+    }
+}
+
+/// Answer now: a typed question, or what the interviewer just said. A typed
+/// question also works without a recording: the copilot starts on demand.
+#[tauri::command]
+pub async fn interview_answer_now(
+    app: AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    question: Option<String>,
+) -> Result<(), String> {
+    let existing = state.interview.lock().unwrap().clone();
+    if let Some(runtime) = existing {
+        return runtime.answer_now(question);
+    }
+    let settings = state.settings.lock().unwrap().clone();
+    if !settings.interview_mode_enabled {
+        return Err("Interview mode is off. Enable it in Settings.".into());
+    }
+    if question.as_deref().map_or(true, |q| q.trim().is_empty()) {
+        return Err("Type a question, or start a session to answer what the other side says.".into());
+    }
+    let started =
+        crate::interview::InterviewRuntime::start(app.clone(), settings.clone(), claude_workspace_dir()).await?;
+    // Another call may have started one while we waited; use whichever landed first.
+    let runtime = {
+        let mut slot = state.interview.lock().unwrap();
+        match slot.as_ref() {
+            Some(winner) => Err((Arc::clone(winner), started)),
+            None => {
+                *slot = Some(Arc::clone(&started));
+                Ok(started)
+            }
+        }
+    };
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err((winner, ours)) => {
+            ours.shutdown().await;
+            winner
+        }
+    };
+    runtime.answer_now(question)
+}
+
+fn interview_settings_changed(previous: &AppSettings, next: &AppSettings) -> bool {
+    previous.interview_mode_enabled != next.interview_mode_enabled
+        || previous.interview_role != next.interview_role
+        || previous.interview_backend != next.interview_backend
+        || previous.interview_auto_answer != next.interview_auto_answer
+        || previous.interview_fast_model != next.interview_fast_model
+        || previous.interview_deep_enabled != next.interview_deep_enabled
+        || previous.interview_deep_model != next.interview_deep_model
+        || previous.interview_deep_thinking != next.interview_deep_thinking
+        || previous.interview_deep_web_search != next.interview_deep_web_search
+        || previous.interview_resume_path != next.interview_resume_path
+        || previous.interview_job_description != next.interview_job_description
+        || previous.interview_extra_context != next.interview_extra_context
+        || previous.transcription_locale != next.transcription_locale
+        || previous.claude_cli_path != next.claude_cli_path
+}
+
+/// Validate the resume file without starting a session.
+#[tauri::command]
+pub fn check_interview_resume(path: String) -> Result<String, String> {
+    let block = contextcall_core::intelligence::interview_engine::load_resume(std::path::Path::new(path.trim()))?;
+    Ok(match block {
+        ContentBlock::Document { .. } => "PDF resume loaded — Claude reads it directly.".into(),
+        ContentBlock::Text { text } => format!("Text resume loaded ({} characters).", text.chars().count()),
+    })
+}
+
+#[tauri::command]
+pub async fn check_claude_cli(path: String, model: String) -> Result<String, String> {
+    let command_path = claude_client::resolve_command_path(&path)?;
+    let version = Command::new(&command_path)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("Could not run `{command_path} --version`: {e}"))?;
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+
+    let mut settings = AppSettings::default();
+    settings.claude_cli_path = command_path;
+    settings.claude_cli_model = model;
+    let started = Instant::now();
+    let config = claude_cli_config(&settings, "Reply with exactly the text requested.");
+    let session = ClaudeCliSession::spawn(&config).await?;
+    let first = claude_client::complete_turn(&session, vec![ContentBlock::text("Reply with exactly: OK")], Duration::from_secs(60))
+        .await
+        .map_err(|err| format!("{version}: smoke test failed: {err}. Run `claude` once in a terminal to sign in."))?;
+    let cold_ms = started.elapsed().as_millis();
+    let warm_started = Instant::now();
+    let _ = claude_client::complete_turn(&session, vec![ContentBlock::text("Reply with exactly: OK")], Duration::from_secs(60)).await;
+    let warm_ms = warm_started.elapsed().as_millis();
+    if first.trim().trim_end_matches('.') == "OK" {
+        Ok(format!("{version}. Smoke test passed — cold start {cold_ms} ms, warm reply {warm_ms} ms."))
+    } else {
+        Err(format!("{version}, but the smoke test returned `{}` instead of `OK`.", first.trim()))
+    }
+}
+
 #[tauri::command]
 pub async fn check_codex_cli(path: String) -> Result<String, String> {
     let command_path = codex_client::resolve_command_path(&path)?;
@@ -2893,6 +3266,18 @@ pub fn save_settings(
     let hide_from_screen_share = s.hide_from_screen_share;
     drop(s);
 
+    // An on-demand copilot (no recording) restarts with the new settings on the next question.
+    if !is_running && interview_settings_changed(&previous_settings, &new_settings) {
+        if let Some(runtime) = state.interview.lock().unwrap().take() {
+            let app = app.clone();
+            let settings = new_settings.clone();
+            tauri::async_runtime::spawn(async move {
+                runtime.shutdown().await;
+                crate::interview::status_stopped(&app, &settings);
+            });
+        }
+    }
+
     if changes.kb_config_changed {
         reinitialize_knowledge_base(&state, &new_settings);
     }
@@ -3069,6 +3454,7 @@ pub fn start_transcription(
     if let Some(overlay) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = overlay.hide();
     }
+    start_interview_if_enabled(&app, &state, &settings);
 
     let app_clone = app.clone();
     let state_clone = Arc::clone(&state);
@@ -3132,6 +3518,25 @@ pub fn start_transcription(
         let them_state = Arc::clone(&state_clone);
         let them_backend = backend.clone();
         let them_lang = language.clone();
+        let them_speaker_tagger = AppState::speaker_tagger_config(&settings);
+        if them_speaker_tagger.is_none() && settings.diarization_enabled && fluid_audio::supported()
+        {
+            // Speaker labels for engines without diarization need the FluidAudio
+            // embedding models; fetch them in the background for the next session.
+            let tagger_config = AppState::fluid_audio_config(&settings);
+            if tagger_config.helper_available()
+                && !matches!(
+                    &backend,
+                    SttBackend::Parakeet(_) | SttBackend::FluidAudio(_)
+                )
+            {
+                std::thread::spawn(move || {
+                    if let Err(e) = fluid_audio::ensure_model(&tagger_config, false, |_| {}) {
+                        log::warn!("[fluidaudio] background diarizer setup failed: {e}");
+                    }
+                });
+            }
+        }
         let recent_utterances_spawn = Arc::clone(&recent_utterances);
         let echo_reference_for_them = echo_reference.clone();
 
@@ -3215,6 +3620,7 @@ pub fn start_transcription(
                     chrono::Utc::now(),
                 );
 
+                forward_to_interview(&state_sg, &utterance);
                 push_recent_utterance(
                     &recent_utterances_clone,
                     utterance.clone(),
@@ -3262,7 +3668,8 @@ pub fn start_transcription(
                     .with_progress(on_them_progress)
                     .with_stop_signal(Arc::clone(&them_state.stop_requested))
                     .with_diarization(settings.diarization_enabled)
-                    .with_clear_speakers_on_start(true);
+                    .with_clear_speakers_on_start(true)
+                    .with_speaker_tagger(them_speaker_tagger);
             if let Some(worker) = warmed_sys {
                 transcriber = transcriber.with_parakeet_worker(worker);
             }
@@ -3306,6 +3713,10 @@ pub fn start_transcription(
                 }
 
                 let settings = suggestion_state.settings.lock().unwrap().clone();
+                if settings.interview_mode_enabled {
+                    // Interview mode answers each question as it is asked instead.
+                    continue;
+                }
                 if !settings.suggestions_enabled {
                     *suggestion_state.overlay_suggestion.lock().unwrap() = None;
                     if let Some(overlay) = suggestion_app.get_webview_window(OVERLAY_LABEL) {
@@ -3547,16 +3958,18 @@ pub fn start_transcription(
                 participant_label: "You".into(),
             };
             app_y.emit("transcript", &payload).ok();
+            let utterance = contextcall_core::models::Utterance {
+                id: uuid::Uuid::new_v4(),
+                text: text.clone(),
+                speaker: Speaker::You,
+                participant_id: Some("you".into()),
+                participant_label: Some("You".into()),
+                timestamp: chrono::Utc::now(),
+            };
+            forward_to_interview(&state_y, &utterance);
             push_recent_utterance(
                 &recent_utterances,
-                contextcall_core::models::Utterance {
-                    id: uuid::Uuid::new_v4(),
-                    text: text.clone(),
-                    speaker: Speaker::You,
-                    participant_id: Some("you".into()),
-                    participant_label: Some("You".into()),
-                    timestamp: chrono::Utc::now(),
-                },
+                utterance,
                 suggestion_context_window_secs,
             );
             let record = SessionRecord {
@@ -4149,8 +4562,89 @@ pub async fn download_stt_model(
         return run_llama_server_setup(&app, &settings).await;
     }
 
+    if selected_provider == "fluidaudio" {
+        return run_fluid_audio_setup(&app, &settings, true).await;
+    }
+
     let model = resolve_whisper_model(&settings).to_string();
-    download_model(app, model).await
+    download_model(app.clone(), model).await?;
+    // whisper-rs has no diarization of its own; on macOS the FluidAudio sidecar
+    // supplies speaker IDs. Best effort: a failure here leaves transcription usable.
+    if AppState::speaker_tagger_config(&settings).is_none()
+        && settings.diarization_enabled
+        && fluid_audio::supported()
+    {
+        if let Err(e) = run_fluid_audio_setup(&app, &settings, false).await {
+            log::warn!("[fluidaudio] speaker diarization setup failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Downloads and compiles the FluidAudio CoreML models (Parakeet ASR when `asr`,
+/// plus speaker embeddings when diarization is on). The first ANE compile takes
+/// a few minutes; later loads take seconds.
+async fn run_fluid_audio_setup(
+    app: &AppHandle,
+    settings: &AppSettings,
+    asr: bool,
+) -> Result<(), String> {
+    let config = AppState::fluid_audio_config(settings);
+    let label = if asr {
+        "Parakeet (FluidAudio)"
+    } else {
+        "speaker diarization (FluidAudio)"
+    };
+    app.emit(
+        "stt-setup-status",
+        &SttSetupStatusPayload {
+            stage: "model".into(),
+            message: format!(
+                "Downloading and optimizing {label} for the Neural Engine. The first run takes a few minutes..."
+            ),
+        },
+    )
+    .ok();
+    app.emit("model-download-progress", 5).ok();
+
+    let app_log = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        fluid_audio::ensure_model(&config, asr, move |line| {
+            if let Some(pct) = fluid_audio_progress_pct(line) {
+                app_log.emit("model-download-progress", pct).ok();
+            }
+            app_log.emit("stt-install-log", line.to_string()).ok();
+        })
+    })
+    .await
+    .map_err(|e| format!("FluidAudio setup task failed: {e}"))??;
+
+    app.emit("model-download-progress", 100).ok();
+    app.emit(
+        "stt-setup-status",
+        &SttSetupStatusPayload {
+            stage: "done".into(),
+            message: format!("{label} is ready."),
+        },
+    )
+    .ok();
+    if asr {
+        app.emit("model-download-done", ()).ok();
+    }
+    Ok(())
+}
+
+/// Maps helper progress lines ("[fluidaudio] progress downloading 3/10 42%") onto
+/// 5–90%; compilation then fills the rest of the bar.
+fn fluid_audio_progress_pct(line: &str) -> Option<u32> {
+    let rest = line.split("progress downloading ").nth(1)?;
+    let pct: u32 = rest
+        .split_whitespace()
+        .nth(1)?
+        .trim_end_matches('%')
+        .parse()
+        .ok()?;
+    Some(5 + pct.min(100) * 85 / 100)
 }
 
 /// Self-service setup for the Gemma 4 (llama-server) backend: downloads the pinned
@@ -4390,7 +4884,18 @@ async fn generate_notes_for_session(
 
     ensure_llama_for_provider(&settings, &settings.llm_provider).await?;
 
-    let result = if settings.llm_provider == "codex-cli" {
+    let result = if settings.llm_provider == "claude-cli" {
+        let messages =
+            notes_engine::build_notes_messages(&records, &template, &settings.transcription_locale);
+        let app_c = app.clone();
+        let emit_chunks = behavior.emit_chunks;
+        stream_notes_with_claude_cli(&settings, messages, move |chunk| {
+            if emit_chunks {
+                app_c.emit("notes-chunk", chunk).ok();
+            }
+        })
+        .await
+    } else if settings.llm_provider == "codex-cli" {
         let messages =
             notes_engine::build_notes_messages(&records, &template, &settings.transcription_locale);
         let markdown =
@@ -4658,6 +5163,21 @@ pub async fn choose_folder(app: AppHandle) -> Option<String> {
         app.dialog()
             .file()
             .blocking_pick_folder()
+            .and_then(|f| f.into_path().ok())
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[tauri::command]
+pub async fn choose_resume_file(app: AppHandle) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .add_filter("Resume", &["pdf", "md", "markdown", "txt"])
+            .blocking_pick_file()
             .and_then(|f| f.into_path().ok())
             .map(|p| p.to_string_lossy().into_owned())
     })
@@ -5201,6 +5721,19 @@ mod tests {
             "```json\n{\"shouldSurface\": false}\n```"
         ));
         assert!(!is_valid_json_response("not json"));
+    }
+
+    #[test]
+    fn fluid_audio_progress_pct_maps_download_lines() {
+        assert_eq!(
+            fluid_audio_progress_pct("[fluidaudio] progress downloading 3/10 0%"),
+            Some(5)
+        );
+        assert_eq!(
+            fluid_audio_progress_pct("[fluidaudio] progress downloading 10/10 100%"),
+            Some(90)
+        );
+        assert_eq!(fluid_audio_progress_pct("[fluidaudio] progress compiling Encoder"), None);
     }
 
     #[test]

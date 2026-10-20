@@ -17,10 +17,11 @@ import { EnginesSection } from "./settings/EnginesSection";
 import { KnowledgeSection } from "./settings/KnowledgeSection";
 import { AudioSection } from "./settings/AudioSection";
 import { PrivacySection } from "./settings/PrivacySection";
+import { InterviewSection } from "./settings/InterviewSection";
 import { useSettingsDisclosure } from "./settings/useSettingsDisclosure";
 import { searchSettings } from "./settings/settingsSearch";
 
-type Tab = "audio" | "engines" | "ai" | "prompts";
+type Tab = "audio" | "engines" | "ai" | "interview" | "prompts";
 
 interface SettingsViewProps {
   settings?: AppSettings | null;
@@ -676,6 +677,12 @@ export function SettingsView({
           AI
         </button>
         <button
+          style={styles.tab(activeTab === "interview")}
+          onClick={() => setActiveTab("interview")}
+        >
+          Interview
+        </button>
+        <button
           style={styles.tab(activeTab === "prompts")}
           onClick={() => setActiveTab("prompts")}
         >
@@ -784,6 +791,17 @@ export function SettingsView({
           isSettingUpStt={isSettingUpStt}
           showAdvanced={showAdvanced}
           onToggleAdvanced={setShowAdvanced}
+        />
+      )}
+
+      {/* Interview Tab */}
+      {activeTab === "interview" && (
+        <InterviewSection
+          settings={settings}
+          styles={styles}
+          applyImmediateSettings={applyImmediateSettings}
+          setSettings={setSettings}
+          commitSettingsDraft={commitSettingsDraft}
         />
       )}
 

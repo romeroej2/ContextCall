@@ -2,7 +2,54 @@
 
 All notable changes to ContextCall are documented here.
 
-Format: `## [1.0.0] — Initial release
+Format: `## [Unreleased]
+
+### Claude brain
+
+- **Claude CLI provider** - new "Claude CLI" AI mode that runs your own local
+  `claude` login (ContextCall never reads or stores its credentials). Live
+  suggestions share one warm conversation per recording session, so each one
+  builds on the previous ones instead of starting from zero. Notes and
+  auto-summaries stream through Claude too.
+- **Shared conversation interface** - `ConversationSession` abstracts
+  persistent multi-turn backends, so the Claude CLI and the Anthropic API
+  (in progress on its own branch) are interchangeable.
+
+### Interview mode
+
+- **Live interview copilot** - detects interviewer questions (question marks,
+  "walk me through…", "tell me about…", Spanish openers too) the moment they
+  are transcribed and streams two answers: a quick first-person answer to say
+  right away (first words in ~1 s) and a deeper technical answer from Opus.
+- **Grounded in your resume** - PDF, Markdown or text resume plus job
+  description and notes are loaded once at session start; PDFs go to Claude
+  as documents.
+- **Keeps context** - both tiers remember the whole interview, so follow-ups
+  make sense; a new question interrupts an answer still streaming; small talk
+  is ignored.
+- **Ask anytime** - type a question (answered directly, even without
+  recording), or press Answer for what the interviewer just said.
+- **Consultant role**, configurable quick/depth models (Haiku default for the
+  quick tier), optional thinking and web search for the depth tier, English
+  pinning when the language is set to English.
+- **Interview workspace** - answers beside the live transcript.
+
+### Speech-to-text
+
+- **whisper-rs is the default engine** - in-process, no Python or server, small
+  model download.
+- **FluidAudio (macOS, Apple Silicon)** - Parakeet TDT on the Neural Engine via
+  a Swift helper, with speaker labels; honors the transcription language and
+  offers an English-only v2 model.
+
+### Fixes
+
+- Notes and auto-summaries no longer fail with `401 Unauthorized` when a CLI
+  provider is selected.
+- `tauri dev` no longer rebuilds in a loop while the FluidAudio helper compiles
+  (`.taurignore`).
+
+## [1.0.0] — Initial release
 
 ### Highlights
 

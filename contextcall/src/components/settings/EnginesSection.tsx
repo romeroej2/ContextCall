@@ -12,6 +12,7 @@ import {
   transcriptionLocaleOptions,
   whisperModelOptions,
   sttProviderOptions,
+  fluidAudioModelOptions,
   parakeetModelOptions,
   parakeetDeviceOptions,
   omniAsrModelOptions,
@@ -65,8 +66,18 @@ export function EnginesSection({
   showAdvanced,
   onToggleAdvanced,
 }: EnginesSectionProps) {
+  // FluidAudio runs on CoreML / the Apple Neural Engine, so it is offered on Macs only;
+  // its speaker diarization also covers whisper-rs there.
+  const isMac = !isWindows && /mac/i.test(navigator.userAgent);
+  const providerOptions = isMac ? sttProviderOptions : sttProviderOptions.filter((o) => o.value !== "fluidaudio");
+  const showDiarization = settings.sttProvider === "parakeet" || (isMac && (settings.sttProvider === "fluidaudio" || settings.sttProvider === "whisper-rs"));
+
   const localeHint =
-    settings.sttProvider === "faster-whisper"
+    settings.sttProvider === "fluidaudio"
+      ? settings.transcriptionLocale === "auto"
+        ? `ContextCall will use Parakeet (${settings.fluidAudioModel}) on the Neural Engine and detect the language of each segment. Pick a specific language if transcripts drift between languages.`
+        : `ContextCall will use Parakeet (${settings.fluidAudioModel}) on the Neural Engine, held to ${settings.transcriptionLocale}.`
+      : settings.sttProvider === "faster-whisper"
       ? `ContextCall will use faster-whisper ${settings.fasterWhisperModel}.`
       : settings.sttProvider === "parakeet"
       ? `ContextCall will use Parakeet v3 (${settings.parakeetModel}). Language is auto-detected from audio.`
@@ -94,9 +105,9 @@ export function EnginesSection({
           styles={styles}
           label="STT Provider"
           value={settings.sttProvider}
-          options={sttProviderOptions}
+          options={providerOptions}
           onChange={(v) => applyImmediateSettings({ sttProvider: v })}
-          hint={sttProviderOptions.find((o) => o.value === settings.sttProvider)?.description}
+          hint={providerOptions.find((o) => o.value === settings.sttProvider)?.description}
         />
 
         <LabeledSelect
@@ -111,7 +122,16 @@ export function EnginesSection({
         <AdvancedToggle checked={showAdvanced} onChange={onToggleAdvanced} styles={styles} />
         {showAdvanced && (
           <>
-            {settings.sttProvider === "whisper-rs" ? (
+            {settings.sttProvider === "fluidaudio" ? (
+              <LabeledSelect
+                styles={styles}
+                label="Parakeet Model"
+                value={settings.fluidAudioModel}
+                options={fluidAudioModelOptions}
+                onChange={(v) => applyImmediateSettings({ fluidAudioModel: v })}
+                hint={fluidAudioModelOptions.find((o) => o.value === settings.fluidAudioModel)?.description}
+              />
+            ) : settings.sttProvider === "whisper-rs" ? (
               <LabeledSelect
                 styles={styles}
                 label="Whisper Model"
@@ -167,23 +187,6 @@ export function EnginesSection({
                   options={parakeetDeviceOptions}
                   onChange={(v) => applyImmediateSettings({ parakeetDevice: v })}
                 />
-                <div style={styles.fieldWrap}>
-                  <label style={styles.labelStyle}>Speaker diarization</label>
-                  <div style={{ display: "flex", alignItems: "center", gap: spacing[2] }}>
-                    <input
-                      type="checkbox"
-                      id="diarization-toggle"
-                      checked={settings.diarizationEnabled ?? true}
-                      onChange={(e) => applyImmediateSettings({ diarizationEnabled: e.target.checked })}
-                    />
-                    <label htmlFor="diarization-toggle" style={{ fontSize: typography.sm, color: colors.text, cursor: "pointer" }}>
-                      Enabled
-                    </label>
-                  </div>
-                  <span style={{ fontSize: typography.sm, color: colors.textMuted, marginTop: 4, display: "block" }}>
-                    Automatically identify different speakers in call audio
-                  </span>
-                </div>
                 <div style={styles.fieldWrap}>
                   <label style={styles.labelStyle}>Echo cancellation</label>
                   <div style={{ display: "flex", alignItems: "center", gap: spacing[2] }}>
@@ -389,6 +392,26 @@ export function EnginesSection({
               </div>
             )}
 
+            {showDiarization && (
+              <div style={styles.fieldWrap}>
+                <label style={styles.labelStyle}>Speaker diarization</label>
+                <div style={{ display: "flex", alignItems: "center", gap: spacing[2] }}>
+                  <input
+                    type="checkbox"
+                    id="diarization-toggle"
+                    checked={settings.diarizationEnabled ?? true}
+                    onChange={(e) => applyImmediateSettings({ diarizationEnabled: e.target.checked })}
+                  />
+                  <label htmlFor="diarization-toggle" style={{ fontSize: typography.sm, color: colors.text, cursor: "pointer" }}>
+                    Enabled
+                  </label>
+                </div>
+                <span style={{ fontSize: typography.sm, color: colors.textMuted, marginTop: 4, display: "block" }}>
+                  Automatically identify different speakers in call audio
+                </span>
+              </div>
+            )}
+
             {sttStatus && (
               <div style={{ marginTop: spacing[2], display: "flex", flexDirection: "column", gap: spacing[2] }}>
                 <span style={styles.statusBadge(sttStatus.ready ? (sttStatus.usingFallback ? "warning" : "success") : "error")}>
@@ -397,7 +420,7 @@ export function EnginesSection({
                 <span style={{ fontSize: typography.sm, color: colors.textMuted }}>
                   Active backend: `{sttStatus.effectiveProvider}` using `{sttStatus.effectiveModel}`.
                 </span>
-                {(settings.sttProvider === "faster-whisper" || settings.sttProvider === "parakeet" || settings.sttProvider === "omni-asr" || settings.sttProvider === "cohere-transcribe" || settings.sttProvider === "llama-server") && (
+                {(settings.sttProvider === "faster-whisper" || settings.sttProvider === "parakeet" || settings.sttProvider === "omni-asr" || settings.sttProvider === "cohere-transcribe" || settings.sttProvider === "llama-server" || settings.sttProvider === "fluidaudio") && (
                   <button style={styles.button} onClick={() => onSetupStt?.()} disabled={isSettingUpStt}>
                     {isSettingUpStt
                       ? `Setting up ${settings.sttProvider}...`

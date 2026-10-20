@@ -18,6 +18,7 @@ import { CompanionShell, type DrawerKey } from "./components/CompanionShell";
 import { SessionHistoryPanel } from "./components/SessionHistoryPanel";
 import { SuggestionsDrawer } from "./components/SuggestionsDrawer";
 import { TranscriptWorkspace } from "./components/TranscriptWorkspace";
+import { InterviewWorkspace } from "./components/InterviewWorkspace";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { liveSessionStore, useLiveSessionStore } from "./hooks/useLiveSessionStore";
 import { useLiveSessionSubscriptions } from "./hooks/useLiveSessionSubscriptions";
@@ -96,6 +97,7 @@ function sttProviderLabel(provider: string): string {
   if (provider === "omni-asr") return "omni-asr";
   if (provider === "cohere-transcribe") return "cohere-transcribe";
   if (provider === "llama-server") return "Gemma 4 (llama-server)";
+  if (provider === "fluidaudio") return "Parakeet (Neural Engine)";
   return "whisper-rs";
 }
 
@@ -138,6 +140,7 @@ function App() {
   const [currentSessionId, setCurrentSessionId] = useState<string | undefined>();
   const [currentSessionNotes, setCurrentSessionNotes] = useState<EnhancedNotes | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const interviewModeEnabled = settings?.interviewModeEnabled ?? false;
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [sttStatus, setSttStatus] = useState<SttStatus | null>(null);
   const [isSettingUpStt, setIsSettingUpStt] = useState(false);
@@ -708,14 +711,24 @@ function App() {
       : 0;
 
   const navItems = [
-    { key: "transcript" as const, label: "Transcript", shortLabel: "Tx", icon: "transcript" as const },
     {
-      key: "suggestions" as const,
-      label: "Ideas",
-      shortLabel: "Sg",
-      icon: "ideas" as const,
-      badge: suggestionCount > 0 ? suggestionCount : undefined,
+      key: "transcript" as const,
+      label: interviewModeEnabled ? "Interview" : "Transcript",
+      shortLabel: "Tx",
+      icon: "transcript" as const,
     },
+    // Interview answers live in the main pane, so the Ideas drawer would only duplicate them.
+    ...(interviewModeEnabled
+      ? []
+      : [
+          {
+            key: "suggestions" as const,
+            label: "Ideas",
+            shortLabel: "Sg",
+            icon: "ideas" as const,
+            badge: suggestionCount > 0 ? suggestionCount : undefined,
+          },
+        ]),
     {
       key: "notes" as const,
       label: "Notes",
@@ -863,7 +876,13 @@ function App() {
           </div>
         ) : undefined
       }
-      transcriptPanel={<TranscriptWorkspace currentSessionId={currentSessionId} />}
+      transcriptPanel={
+        interviewModeEnabled ? (
+          <InterviewWorkspace currentSessionId={currentSessionId} isRecording={isRunning} />
+        ) : (
+          <TranscriptWorkspace currentSessionId={currentSessionId} />
+        )
+      }
       drawerContent={
         <>
           <div style={paneStyle(activeDrawer === "history")}>

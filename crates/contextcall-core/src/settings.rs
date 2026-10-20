@@ -73,6 +73,10 @@ pub struct AppSettings {
     )]
     pub cohere_transcribe_device: String,
 
+    /// FluidAudio Parakeet variant (macOS): "v3" or "ultra".
+    #[serde(default = "default_fluid_audio_model", alias = "fluid_audio_model")]
+    pub fluid_audio_model: String,
+
     #[serde(default, alias = "system_audio_device_name")]
     pub system_audio_device_name: Option<String>,
 
@@ -192,6 +196,57 @@ pub struct AppSettings {
 
     #[serde(default)]
     pub last_recording_dir: Option<String>,
+
+    // ── Claude CLI ("brain" via the user's own `claude` login) ──
+    #[serde(default = "default_claude_cli_path")]
+    pub claude_cli_path: String,
+
+    /// Model for regular suggestions/notes when `llm_provider == "claude-cli"`.
+    #[serde(default = "default_claude_cli_model")]
+    pub claude_cli_model: String,
+
+    // ── Interview mode ──
+    #[serde(default)]
+    pub interview_mode_enabled: bool,
+
+    /// Transport for interview sessions: "claude-cli".
+    #[serde(default = "default_interview_backend")]
+    pub interview_backend: String,
+
+    /// Copilot persona: "interview" (you are the candidate) or "consultant"
+    /// (expert assistant for any call: answers what others ask and what you type).
+    #[serde(default = "default_interview_role")]
+    pub interview_role: String,
+
+    /// Answer automatically when the interviewer asks something (else only on demand).
+    #[serde(default = "default_true")]
+    pub interview_auto_answer: bool,
+
+    #[serde(default = "default_interview_fast_model")]
+    pub interview_fast_model: String,
+
+    #[serde(default = "default_true")]
+    pub interview_deep_enabled: bool,
+
+    #[serde(default = "default_interview_deep_model")]
+    pub interview_deep_model: String,
+
+    /// Let the deep tier think before answering (deeper, slower).
+    #[serde(default)]
+    pub interview_deep_thinking: bool,
+
+    /// Let the deep tier use web search (much slower; for research questions).
+    #[serde(default)]
+    pub interview_deep_web_search: bool,
+
+    #[serde(default)]
+    pub interview_resume_path: Option<String>,
+
+    #[serde(default)]
+    pub interview_job_description: String,
+
+    #[serde(default)]
+    pub interview_extra_context: String,
 }
 
 impl AppSettings {
@@ -283,6 +338,7 @@ impl Default for AppSettings {
             omni_asr_device: default_omni_asr_device(),
             cohere_transcribe_model: default_cohere_transcribe_model(),
             cohere_transcribe_device: default_cohere_transcribe_device(),
+            fluid_audio_model: default_fluid_audio_model(),
             system_audio_device_name: None,
             hugging_face_token: None,
             llm_provider: default_llm_provider(),
@@ -319,8 +375,41 @@ impl Default for AppSettings {
             mic_capture_mode: MicCaptureMode::Auto,
             push_to_talk_hotkey: default_push_to_talk_hotkey(),
             last_recording_dir: None,
+            claude_cli_path: default_claude_cli_path(),
+            claude_cli_model: default_claude_cli_model(),
+            interview_mode_enabled: false,
+            interview_backend: default_interview_backend(),
+            interview_role: default_interview_role(),
+            interview_auto_answer: true,
+            interview_fast_model: default_interview_fast_model(),
+            interview_deep_enabled: true,
+            interview_deep_model: default_interview_deep_model(),
+            interview_deep_thinking: false,
+            interview_deep_web_search: false,
+            interview_resume_path: None,
+            interview_job_description: String::new(),
+            interview_extra_context: String::new(),
         }
     }
+}
+
+fn default_claude_cli_path() -> String {
+    "claude".into()
+}
+fn default_claude_cli_model() -> String {
+    "sonnet".into()
+}
+fn default_interview_backend() -> String {
+    "claude-cli".into()
+}
+fn default_interview_role() -> String {
+    "interview".into()
+}
+fn default_interview_fast_model() -> String {
+    "haiku".into()
+}
+fn default_interview_deep_model() -> String {
+    "opus".into()
 }
 
 fn default_mic_threshold_multiplier() -> f32 {
@@ -335,7 +424,8 @@ fn default_whisper_model() -> String {
     "auto".into()
 }
 fn default_stt_provider() -> String {
-    "llama-server".into()
+    // In-process, no Python or server, small model download: easiest first run.
+    "whisper-rs".into()
 }
 fn default_faster_whisper_model() -> String {
     "base".into()
@@ -363,6 +453,9 @@ fn default_cohere_transcribe_model() -> String {
 }
 fn default_cohere_transcribe_device() -> String {
     "auto".into()
+}
+fn default_fluid_audio_model() -> String {
+    crate::transcription::fluid_audio::DEFAULT_MODEL.into()
 }
 fn default_model() -> String {
     "nvidia/nemotron-3-nano-4b".into()
@@ -531,6 +624,20 @@ mod tests {
     }
 
     #[test]
+    fn interview_defaults_are_off_with_fast_haiku_and_deep_opus() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.interview_mode_enabled);
+        assert_eq!(settings.interview_backend, "claude-cli");
+        assert!(settings.interview_auto_answer);
+        assert_eq!(settings.interview_role, "interview");
+        assert_eq!(settings.interview_fast_model, "haiku");
+        assert!(settings.interview_deep_enabled);
+        assert_eq!(settings.interview_deep_model, "opus");
+        assert!(!settings.interview_deep_thinking);
+        assert_eq!(settings.claude_cli_path, "claude");
+    }
+
+    #[test]
     fn whisper_model_missing_from_json_uses_default() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -564,11 +671,11 @@ mod tests {
     }
 
     #[test]
-    fn stt_provider_defaults_to_llama_server() {
+    fn stt_provider_defaults_to_whisper_rs() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
         let s = AppSettings::load_from(path);
-        assert_eq!(s.stt_provider, "llama-server");
+        assert_eq!(s.stt_provider, "whisper-rs");
         assert_eq!(s.faster_whisper_model, "base");
         assert_eq!(s.faster_whisper_compute_type, "default");
         assert_eq!(s.faster_whisper_device, "auto");
@@ -868,7 +975,7 @@ mod tests {
         assert!(s.input_device_name.is_none());
         assert!(s.system_audio_device_name.is_none());
         // STT runs locally by default.
-        assert_eq!(s.stt_provider, "llama-server");
+        assert_eq!(s.stt_provider, "whisper-rs");
         // LLM + embeddings point at a local endpoint by default (no cloud egress).
         assert!(
             s.open_ai_llm_base_url.starts_with("http://127.0.0.1")

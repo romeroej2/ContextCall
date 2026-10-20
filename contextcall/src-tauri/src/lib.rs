@@ -2,6 +2,7 @@
 mod audio_macos;
 mod audio_windows;
 mod engine;
+mod interview;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -22,6 +23,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             engine::check_model,
             engine::check_codex_cli,
+            engine::check_claude_cli,
+            engine::check_interview_resume,
+            engine::interview_answer_now,
             engine::get_codex_usage_summary,
             engine::get_model_path,
             engine::get_stt_status,
@@ -52,6 +56,7 @@ pub fn run() {
             engine::set_overlay_size,
             engine::set_content_protection,
             engine::choose_folder,
+            engine::choose_resume_file,
             engine::choose_obsidian_include_folder,
             engine::list_templates,
             engine::save_template,

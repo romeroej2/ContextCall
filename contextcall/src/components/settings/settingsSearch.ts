@@ -2,7 +2,7 @@
 // Maps each setting label to its tab and whether it lives in the advanced group,
 // so search can jump to the right tab and auto-expand advanced when needed.
 
-export type SettingTab = "audio" | "engines" | "ai" | "prompts";
+export type SettingTab = "audio" | "engines" | "ai" | "interview" | "prompts";
 
 export interface SettingEntry {
   label: string;
@@ -26,10 +26,13 @@ export const SETTINGS_INDEX: SettingEntry[] = [
   { label: "Speaker diarization", tab: "engines", advanced: true, keywords: "diarization speakers" },
   { label: "Echo cancellation", tab: "engines", advanced: true, keywords: "echo aec" },
   { label: "Hugging Face Token", tab: "engines", advanced: true, keywords: "hf token cohere gated" },
-  { label: "AI Mode", tab: "ai", advanced: false, keywords: "local cloud gemma codex ollama mode" },
+  { label: "AI Mode", tab: "ai", advanced: false, keywords: "local cloud gemma codex claude ollama mode" },
   { label: "Language Model", tab: "ai", advanced: false, keywords: "llm model openrouter ollama openai api key" },
   { label: "Embeddings", tab: "ai", advanced: true, keywords: "voyage embedding knowledge search" },
   { label: "Knowledge & Notes (Obsidian)", tab: "ai", advanced: false, keywords: "obsidian vault kb notes template" },
+  { label: "Interview Mode", tab: "interview", advanced: false, keywords: "interview job resume cv copilot claude opus haiku answer questions consultant assistant role ask" },
+  { label: "Resume", tab: "interview", advanced: false, keywords: "resume cv pdf candidate" },
+  { label: "Job Description", tab: "interview", advanced: false, keywords: "role job posting company" },
   { label: "Suggestion Prompts", tab: "prompts", advanced: false, keywords: "suggestion prompt customize" },
 ];
 

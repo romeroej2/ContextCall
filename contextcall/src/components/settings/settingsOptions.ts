@@ -44,14 +44,20 @@ export const whisperModelOptions = [
 ];
 
 export const sttProviderOptions = [
+  { value: "whisper-rs", label: "whisper-rs (Recommended)", description: "Default. In-process local transcription with ggml Whisper models. No extra dependencies — just a small model download." },
   {
     value: "llama-server",
     label: "Gemma 4 12B (llama-server)",
     description:
-      "Default. Local Gemma 4 12B multimodal audio transcription via a bundled llama.cpp server. No Python required - one-click setup downloads everything (~7.6 GB) and reuses LM Studio models when found. The same server also powers the local AI agent.",
+      "Local Gemma 4 12B multimodal audio transcription via a bundled llama.cpp server. No Python required - one-click setup downloads everything (~7.6 GB) and reuses LM Studio models when found. The same server also powers the local AI agent.",
   },
-  { value: "whisper-rs", label: "whisper-rs", description: "In-process local transcription with ggml Whisper models. No extra dependencies required." },
   { value: "faster-whisper", label: "faster-whisper", description: "Worker-based backend with app-managed Python runtime. Requires Python 3 on your system." },
+  {
+    value: "fluidaudio",
+    label: "Parakeet on Neural Engine (macOS)",
+    description:
+      "NVIDIA Parakeet TDT v3 compiled for the Apple Neural Engine via FluidAudio. 25 languages with auto-detect, fastest local option on Apple Silicon. No Python — one-click ~470 MB model download. Includes speaker diarization.",
+  },
   { value: "parakeet", label: "parakeet", description: "NVIDIA Parakeet TDT v3 — multilingual, 25 languages, automatic language detection. Requires Python 3 and ~3 GB disk." },
   { value: "omni-asr", label: "Omni-ASR", description: "facebookresearch/omnilingual-asr — supports 1,600+ languages. Requires Python 3 (Linux/macOS) or WSL2 + Python 3 (Windows)." },
   {
@@ -60,6 +66,12 @@ export const sttProviderOptions = [
     description:
       "Local CohereLabs/cohere-transcribe-03-2026 via Transformers. Requires Python 3, a Hugging Face token, and a supported explicit locale.",
   },
+];
+
+export const fluidAudioModelOptions = [
+  { value: "v3", label: "Parakeet TDT 0.6B v3 (Recommended)", description: "NVIDIA's multilingual model: 25 European languages with automatic language detection." },
+  { value: "ultra", label: "Parakeet Ultra", description: "Full-precision post-training of v3 with the same languages; separate ~470 MB download." },
+  { value: "v2", label: "Parakeet TDT 0.6B v2 (English only)", description: "English-only model — never switches languages. Use it for English-only calls." },
 ];
 
 export const parakeetModelOptions = [

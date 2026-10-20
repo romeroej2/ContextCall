@@ -2,3 +2,6 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# FluidAudio sidecar staged by build.rs
+/binaries/

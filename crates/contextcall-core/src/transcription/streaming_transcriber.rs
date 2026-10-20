@@ -17,13 +17,19 @@ pub enum SegmentProgress {
 
 #[derive(Clone)]
 pub enum SttBackend {
-    WhisperRs { model_path: String },
+    WhisperRs {
+        model_path: String,
+    },
     FasterWhisper(crate::transcription::faster_whisper::FasterWhisperConfig),
     Parakeet(crate::transcription::parakeet::ParakeetConfig),
     OmniAsr(crate::transcription::omni_asr::OmniAsrConfig),
     CohereTranscribe(crate::transcription::cohere_transcribe::CohereTranscribeConfig),
     /// Gemma 4 12B audio STT served by the managed llama-server instance.
-    LlamaServer { base_url: String },
+    LlamaServer {
+        base_url: String,
+    },
+    /// Parakeet TDT on CoreML / ANE via the FluidAudio sidecar (macOS).
+    FluidAudio(crate::transcription::fluid_audio::FluidAudioConfig),
     Passthrough,
 }
 
@@ -72,6 +78,87 @@ pub struct StreamingTranscriber {
         Option<crate::transcription::cohere_transcribe::CohereTranscribeWorker>,
     diarization_enabled: bool,
     clear_speakers_on_start: bool,
+    /// Speaker-embedding sidecar used for diarization when the STT backend has none.
+    speaker_tagger: Option<crate::transcription::fluid_audio::FluidAudioConfig>,
+}
+
+/// Assigns speaker IDs to finalized segments for backends without built-in
+/// diarization, using a diarization-only FluidAudio sidecar.
+struct SpeakerTagger {
+    worker: crate::transcription::fluid_audio::FluidAudioWorker,
+    window: SpeakerWindow,
+}
+
+impl SpeakerTagger {
+    fn spawn(
+        config: &crate::transcription::fluid_audio::FluidAudioConfig,
+        clear_speakers: bool,
+    ) -> Option<Self> {
+        let mut worker = match crate::transcription::fluid_audio::FluidAudioWorker::spawn(config) {
+            Ok(worker) => worker,
+            Err(e) => {
+                log::warn!("[diarization] speaker tagger unavailable: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = worker.ensure_model(false, true) {
+            log::warn!("[diarization] speaker tagger failed to load: {e}");
+            return None;
+        }
+        if clear_speakers {
+            let _ = worker.clear_speakers();
+        }
+        Some(Self {
+            worker,
+            window: SpeakerWindow::default(),
+        })
+    }
+
+    fn tag(&mut self, samples: &[f32]) -> Option<String> {
+        let worker = &mut self.worker;
+        self.window.tag(samples, |audio| worker.speaker_id(audio))
+    }
+}
+
+/// Picks the audio used for a speaker embedding and keeps the last confirmed ID.
+/// Long segments are embedded on their own so a speaker change isn't smeared with
+/// the previous speaker's audio; short ones borrow a rolling window of recent speech.
+#[derive(Default)]
+struct SpeakerWindow {
+    recent: Vec<f32>,
+    last_speaker_id: Option<String>,
+}
+
+impl SpeakerWindow {
+    const WINDOW_SAMPLES: usize = 4 * 16_000;
+    const STANDALONE_SAMPLES: usize = 3 * 16_000;
+
+    fn tag<F>(&mut self, samples: &[f32], identify: F) -> Option<String>
+    where
+        F: FnOnce(&[f32]) -> Result<Option<String>, String>,
+    {
+        self.recent.extend_from_slice(samples);
+        if self.recent.len() > Self::WINDOW_SAMPLES {
+            let excess = self.recent.len() - Self::WINDOW_SAMPLES;
+            self.recent.drain(..excess);
+        }
+        let audio = if samples.len() >= Self::STANDALONE_SAMPLES {
+            samples
+        } else {
+            &self.recent
+        };
+        match identify(audio) {
+            Ok(Some(id)) => {
+                self.last_speaker_id = Some(id.clone());
+                Some(id)
+            }
+            Ok(None) => self.last_speaker_id.clone(),
+            Err(e) => {
+                log::warn!("[diarization] speaker_id error: {e}");
+                self.last_speaker_id.clone()
+            }
+        }
+    }
 }
 
 impl StreamingTranscriber {
@@ -90,6 +177,7 @@ impl StreamingTranscriber {
             cohere_transcribe_worker: None,
             diarization_enabled: false,
             clear_speakers_on_start: false,
+            speaker_tagger: None,
         }
     }
 
@@ -109,6 +197,7 @@ impl StreamingTranscriber {
             cohere_transcribe_worker: None,
             diarization_enabled: false,
             clear_speakers_on_start: false,
+            speaker_tagger: None,
         }
     }
 
@@ -174,6 +263,16 @@ impl StreamingTranscriber {
         self
     }
 
+    /// Diarize backends that have no speaker ID of their own via the FluidAudio
+    /// sidecar. Ignored unless diarization is enabled.
+    pub fn with_speaker_tagger(
+        mut self,
+        config: Option<crate::transcription::fluid_audio::FluidAudioConfig>,
+    ) -> Self {
+        self.speaker_tagger = config;
+        self
+    }
+
     pub async fn run<S>(self, stream: S)
     where
         S: Stream<Item = Vec<f32>> + Send + 'static,
@@ -201,8 +300,21 @@ impl StreamingTranscriber {
         // false while segments are still being transcribed.
         let diarization_enabled = self.diarization_enabled;
         let clear_speakers_on_start = self.clear_speakers_on_start;
+        let speaker_tagger_config = self.speaker_tagger;
 
         let whisper_task = tokio::task::spawn_blocking(move || {
+            let backend_diarizes = matches!(
+                backend,
+                SttBackend::Parakeet(_) | SttBackend::FluidAudio(_) | SttBackend::Passthrough
+            );
+            let mut speaker_tagger = match speaker_tagger_config {
+                Some(config) if diarization_enabled && !backend_diarizes => {
+                    SpeakerTagger::spawn(&config, clear_speakers_on_start)
+                }
+                _ => None,
+            };
+            let mut tag_speaker =
+                |samples: &[f32]| speaker_tagger.as_mut().and_then(|t| t.tag(samples));
             match backend {
                 SttBackend::WhisperRs { model_path } => {
                     match crate::transcription::whisper::WhisperManager::new(&model_path, &language)
@@ -228,7 +340,7 @@ impl StreamingTranscriber {
                                         "[transcriber] {}",
                                         text.chars().take(80).collect::<String>()
                                     );
-                                    on_final(text, None);
+                                    on_final(text, tag_speaker(&samples));
                                 }
                             }
                         }
@@ -249,7 +361,7 @@ impl StreamingTranscriber {
                                             "[transcriber] {}",
                                             text.chars().take(80).collect::<String>()
                                         );
-                                        on_final(text, None);
+                                        on_final(text, tag_speaker(&samples));
                                     }
                                     Ok(_) => {
                                         if let Some(ref on_progress) = progress_for_backend {
@@ -401,7 +513,7 @@ impl StreamingTranscriber {
                                             "[transcriber] {}",
                                             text.chars().take(80).collect::<String>()
                                         );
-                                        on_final(text, None);
+                                        on_final(text, tag_speaker(&samples));
                                     }
                                     Ok(_) => {
                                         if let Some(ref on_progress) = progress_for_backend {
@@ -450,7 +562,7 @@ impl StreamingTranscriber {
                                             "[transcriber] {}",
                                             text.chars().take(80).collect::<String>()
                                         );
-                                        on_final(text, None);
+                                        on_final(text, tag_speaker(&samples));
                                     }
                                     Ok(_) => {
                                         if let Some(ref on_progress) = progress_for_backend {
@@ -490,7 +602,7 @@ impl StreamingTranscriber {
                                     "[transcriber] {}",
                                     text.chars().take(80).collect::<String>()
                                 );
-                                on_final(text, None);
+                                on_final(text, tag_speaker(&samples));
                             }
                             Ok(_) => {
                                 if let Some(ref on_progress) = progress_for_backend {
@@ -498,6 +610,52 @@ impl StreamingTranscriber {
                                 }
                             }
                             Err(e) => log::error!("llama-server transcribe error: {e}"),
+                        }
+                    }
+                }
+                SttBackend::FluidAudio(config) => {
+                    let mut worker =
+                        match crate::transcription::fluid_audio::FluidAudioWorker::spawn(&config) {
+                            Ok(worker) => worker,
+                            Err(e) => {
+                                log::error!("Failed to launch FluidAudio helper: {e}");
+                                return;
+                            }
+                        };
+                    let diarize = diarization_enabled && config.diarization_enabled;
+                    if let Err(e) = worker.ensure_model(true, diarize) {
+                        log::error!("FluidAudio ensure_model failed: {e}");
+                        return;
+                    }
+                    if diarize && clear_speakers_on_start {
+                        if let Err(e) = worker.clear_speakers() {
+                            log::warn!("[diarization] clear_speakers failed: {e}");
+                        }
+                    }
+                    let mut window = SpeakerWindow::default();
+                    for samples in seg_rx.iter() {
+                        match worker.transcribe(&samples) {
+                            Ok(text) if !text.is_empty() => {
+                                if let Some(ref on_progress) = progress_for_backend {
+                                    on_progress(SegmentProgress::Processed);
+                                }
+                                log::info!(
+                                    "[transcriber] {}",
+                                    text.chars().take(80).collect::<String>()
+                                );
+                                let speaker_id = if diarize {
+                                    window.tag(&samples, |audio| worker.speaker_id(audio))
+                                } else {
+                                    None
+                                };
+                                on_final(text, speaker_id);
+                            }
+                            Ok(_) => {
+                                if let Some(ref on_progress) = progress_for_backend {
+                                    on_progress(SegmentProgress::Processed);
+                                }
+                            }
+                            Err(e) => log::error!("FluidAudio transcribe error: {e}"),
                         }
                     }
                 }
@@ -758,5 +916,50 @@ mod tests {
         transcriber.run(stream::iter(chunks)).await;
 
         assert_eq!(captured.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn speaker_window_embeds_long_segments_alone() {
+        let mut window = SpeakerWindow::default();
+        window.tag(&vec![0.1; 16_000], |_| Ok(Some("speaker_0".into())));
+        let long = vec![0.2; SpeakerWindow::STANDALONE_SAMPLES];
+        let mut seen = 0;
+        window.tag(&long, |audio| {
+            seen = audio.len();
+            Ok(Some("speaker_1".into()))
+        });
+        assert_eq!(seen, long.len());
+    }
+
+    #[test]
+    fn speaker_window_pads_short_segments_with_recent_speech() {
+        let mut window = SpeakerWindow::default();
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            window.tag(&vec![0.1; 16_000], |audio| {
+                seen.push(audio.len());
+                Ok(None)
+            });
+        }
+        assert_eq!(seen[..4], [16_000, 32_000, 48_000, 64_000]);
+        assert_eq!(seen[4..], [SpeakerWindow::WINDOW_SAMPLES; 2]);
+    }
+
+    #[test]
+    fn speaker_window_falls_back_to_last_confirmed_speaker() {
+        let mut window = SpeakerWindow::default();
+        assert_eq!(window.tag(&[0.0; 10], |_| Ok(None)), None);
+        assert_eq!(
+            window.tag(&[0.0; 10], |_| Ok(Some("speaker_2".into()))),
+            Some("speaker_2".into())
+        );
+        assert_eq!(
+            window.tag(&[0.0; 10], |_| Ok(None)),
+            Some("speaker_2".into())
+        );
+        assert_eq!(
+            window.tag(&[0.0; 10], |_| Err("boom".into())),
+            Some("speaker_2".into())
+        );
     }
 }

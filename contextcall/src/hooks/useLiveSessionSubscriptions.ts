@@ -1,7 +1,11 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { KBResult, Suggestion, TranscriptionProgress } from "../types";
-import { liveSessionStore } from "./useLiveSessionStore";
+import type { InterviewStatus, KBResult, Suggestion, TranscriptionProgress } from "../types";
+import {
+  liveSessionStore,
+  type InterviewAnswerPayload,
+  type InterviewQuestionPayload,
+} from "./useLiveSessionStore";
 
 type SuggestionCheckEvent = {
   checkedAt: string;
@@ -66,6 +70,18 @@ export function useLiveSessionSubscriptions() {
 
       listen<SuggestionCheckEvent>("suggestion-check-finished", (event) => {
         liveSessionStore.setSuggestionCheck(event.payload.checkedAt, event.payload.surfaced);
+      }),
+
+      listen<InterviewQuestionPayload>("interview-question", (event) => {
+        liveSessionStore.addInterviewQuestion(event.payload);
+      }),
+
+      listen<InterviewAnswerPayload>("interview-answer", (event) => {
+        liveSessionStore.applyInterviewAnswer(event.payload);
+      }),
+
+      listen<InterviewStatus>("interview-status", (event) => {
+        liveSessionStore.setInterviewStatus(event.payload);
       }),
     ];
 

@@ -1,6 +1,7 @@
 pub mod cohere_transcribe;
 pub mod engine;
 pub mod faster_whisper;
+pub mod fluid_audio;
 pub mod omni_asr;
 pub mod parakeet;
 pub mod parakeet_benchmark;

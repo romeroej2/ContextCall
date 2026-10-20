@@ -1,0 +1,6 @@
+# Paths `tauri dev` must not watch: build.rs writes here, so watching them
+# restarts the dev build in a loop. The whole helpers/ tree is excluded because
+# swift build's writes also touch the package folders themselves; build.rs's
+# rerun-if-changed still rebuilds the helper when its sources change.
+helpers/
+binaries/

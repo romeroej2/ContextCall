@@ -1,5 +1,8 @@
+pub mod claude_client;
 pub mod codex_client;
+pub mod conversation;
 pub mod embedding_client;
+pub mod interview_engine;
 pub mod knowledge_base;
 pub mod llm_client;
 pub mod notes_engine;

@@ -40,6 +40,7 @@ export interface AppSettings {
   omniAsrDevice: string;
   cohereTranscribeModel: string;
   cohereTranscribeDevice: string;
+  fluidAudioModel: string;
   diarizationEnabled: boolean;
   echoCancellationEnabled: boolean;
   micCalibrationRms: number | null;
@@ -75,6 +76,45 @@ export interface AppSettings {
   kbSurfacingSystemPrompt: string;
   suggestionSynthesisSystemPrompt: string;
   smartQuestionSystemPrompt: string;
+  claudeCliPath: string;
+  claudeCliModel: string;
+  interviewModeEnabled: boolean;
+  interviewBackend: string;
+  /** "interview" (you are the candidate) | "consultant" (expert assistant for any call). */
+  interviewRole: string;
+  interviewAutoAnswer: boolean;
+  interviewFastModel: string;
+  interviewDeepEnabled: boolean;
+  interviewDeepModel: string;
+  interviewDeepThinking: boolean;
+  interviewDeepWebSearch: boolean;
+  interviewResumePath: string | null;
+  interviewJobDescription: string;
+  interviewExtraContext: string;
+}
+
+export type InterviewTier = "fast" | "deep";
+
+export interface InterviewAnswer {
+  id: string;
+  question: string;
+  manual: boolean;
+  askedAt: string;
+  fast: string;
+  deep: string;
+  fastDone: boolean;
+  deepDone: boolean;
+  /** Milliseconds from question to first text, per tier. */
+  fastFirstMs: number | null;
+  deepFirstMs: number | null;
+  error: string | null;
+}
+
+export interface InterviewStatus {
+  state: "starting" | "ready" | "error" | "stopped";
+  message: string;
+  fastModel: string;
+  deepModel: string | null;
 }
 
 export interface ApiKeys {

@@ -1,5 +1,13 @@
 import { useSyncExternalStore } from "react";
-import type { KBResult, Suggestion, TranscriptionProgress, Utterance } from "../types";
+import type {
+  InterviewAnswer,
+  InterviewStatus,
+  InterviewTier,
+  KBResult,
+  Suggestion,
+  TranscriptionProgress,
+  Utterance,
+} from "../types";
 
 type SpeakerKey = "you" | "them";
 
@@ -24,7 +32,27 @@ export interface LiveSessionState {
   audioLevels: AudioLevelsState;
   transcriptionProgress: TranscriptionProgress;
   suggestionStatus: SuggestionStatusState;
+  /** Newest last. Interview mode only. */
+  interviewAnswers: InterviewAnswer[];
+  interviewStatus: InterviewStatus | null;
 }
+
+export interface InterviewQuestionPayload {
+  id: string;
+  question: string;
+  manual: boolean;
+  askedAt: string;
+}
+
+export interface InterviewAnswerPayload {
+  id: string;
+  tier: InterviewTier;
+  kind: "delta" | "done" | "dismissed" | "error";
+  text: string;
+  elapsedMs: number;
+}
+
+const MAX_INTERVIEW_ANSWERS = 30;
 
 interface TranscriptPayload {
   text: string;
@@ -88,6 +116,8 @@ const EMPTY_STATE: LiveSessionState = {
   audioLevels: EMPTY_AUDIO_LEVELS,
   transcriptionProgress: EMPTY_TRANSCRIPTION_PROGRESS,
   suggestionStatus: EMPTY_SUGGESTION_STATUS,
+  interviewAnswers: [],
+  interviewStatus: null,
 };
 
 class LiveSessionStore {
@@ -121,6 +151,8 @@ class LiveSessionStore {
       audioLevels: this.state.audioLevels.micTransmitActive
         ? { ...EMPTY_AUDIO_LEVELS, micTransmitActive: false }
         : EMPTY_AUDIO_LEVELS,
+      // Status comes from the backend lifecycle; it can arrive before the reset.
+      interviewStatus: this.state.interviewStatus,
     });
   };
 
@@ -232,6 +264,71 @@ class LiveSessionStore {
         isGenerating,
       },
     }));
+  };
+
+  addInterviewQuestion = (payload: InterviewQuestionPayload) => {
+    this.update((current) => ({
+      ...current,
+      interviewAnswers: [
+        ...current.interviewAnswers,
+        {
+          id: payload.id,
+          question: payload.question,
+          manual: payload.manual,
+          askedAt: payload.askedAt,
+          fast: "",
+          deep: "",
+          fastDone: false,
+          deepDone: false,
+          fastFirstMs: null,
+          deepFirstMs: null,
+          error: null,
+        },
+      ].slice(-MAX_INTERVIEW_ANSWERS),
+    }));
+  };
+
+  applyInterviewAnswer = (payload: InterviewAnswerPayload) => {
+    this.update((current) => {
+      const index = current.interviewAnswers.findIndex((answer) => answer.id === payload.id);
+      if (index === -1) {
+        return current;
+      }
+      if (payload.kind === "dismissed" && payload.tier === "fast") {
+        return {
+          ...current,
+          interviewAnswers: current.interviewAnswers.filter((answer) => answer.id !== payload.id),
+        };
+      }
+      const answer = { ...current.interviewAnswers[index] };
+      const textKey = payload.tier === "fast" ? "fast" : "deep";
+      const doneKey = payload.tier === "fast" ? "fastDone" : "deepDone";
+      const firstKey = payload.tier === "fast" ? "fastFirstMs" : "deepFirstMs";
+      switch (payload.kind) {
+        case "delta":
+          answer[textKey] += payload.text;
+          answer[firstKey] ??= payload.elapsedMs;
+          break;
+        case "done":
+          if (payload.text.trim()) answer[textKey] = payload.text;
+          answer[doneKey] = true;
+          break;
+        case "dismissed":
+          answer[doneKey] = true;
+          break;
+        case "error":
+          answer[doneKey] = true;
+          answer.error = payload.text;
+          break;
+      }
+      const interviewAnswers = [...current.interviewAnswers];
+      interviewAnswers[index] = answer;
+      return { ...current, interviewAnswers };
+    });
+  };
+
+  setInterviewStatus = (interviewStatus: InterviewStatus) => {
+    this.update((current) => ({ ...current, interviewStatus }));
   };
 
   setSuggestionCheck = (checkedAt: string, surfaced: boolean | null) => {

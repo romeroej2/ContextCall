@@ -7,6 +7,7 @@ import type { ApiKeys, AppSettings, CodexUsageSummary, LlamaServerStatus } from 
 import type { SettingsStyles } from "./settingsStyles";
 import { AdvancedToggle } from "./AdvancedToggle";
 import { LabeledTextField } from "./fields";
+import { ClaudeCliCheck } from "./ClaudeCliCheck";
 
 interface AiProvidersSectionProps {
   settings: AppSettings;
@@ -66,6 +67,7 @@ export function AiProvidersSection({
   showAdvanced,
   onToggleAdvanced,
 }: AiProvidersSectionProps) {
+  const isClaudeCliMode = settings.llmProvider === "claude-cli";
   return (
     <div>
       {/* Mode Selection */}
@@ -116,7 +118,20 @@ export function AiProvidersSection({
             </div>
           </div>
           <div
-            style={styles.aiModeCard(!isLocalMode && !isCodexCliMode && !isGemmaLocalMode)}
+            style={styles.aiModeCard(isClaudeCliMode)}
+            onClick={() =>
+              applyImmediateSettings({
+                llmProvider: "claude-cli",
+              })
+            }
+          >
+            <div style={styles.aiModeTitle}>Claude CLI</div>
+            <div style={styles.aiModeDesc}>
+              Uses your local Claude Code login. Live suggestions share one conversation per session, so each one builds on the last. Embeddings stay on the provider configured below.
+            </div>
+          </div>
+          <div
+            style={styles.aiModeCard(!isLocalMode && !isCodexCliMode && !isClaudeCliMode && !isGemmaLocalMode)}
             onClick={() =>
               applyImmediateSettings({
                 llmProvider: "openrouter",
@@ -202,6 +217,25 @@ export function AiProvidersSection({
                 placeholder="8765"
               />
             </div>
+          </>
+        ) : isClaudeCliMode ? (
+          <>
+            <ClaudeCliCheck
+              settings={settings}
+              styles={styles}
+              setSettings={setSettings}
+              commitSettingsDraft={commitSettingsDraft}
+              model={settings.claudeCliModel}
+            />
+            <LabeledTextField
+              styles={styles}
+              label="Model"
+              value={settings.claudeCliModel}
+              onChange={(v) => setSettings({ ...settings, claudeCliModel: v })}
+              onCommit={commitSettingsDraft}
+              placeholder="sonnet"
+              hint="Alias (sonnet, opus, haiku) or a full model id."
+            />
           </>
         ) : settings.llmProvider === "codex-cli" ? (
           <>
