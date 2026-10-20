@@ -21,6 +21,5 @@ contextcall/.npm-cache/
 /docs/superpowers
 logs/
 bun.lock
-package-lock.json
-package-lock.json
+# package-lock.json is committed: CI and release workflows run `npm ci`.
 sdlc-studio/
