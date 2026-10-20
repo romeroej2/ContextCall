@@ -2,7 +2,12 @@
 
 All notable changes to ContextCall are documented here.
 
-Format: `## [Unreleased]
+Format: `## [version] - date`, newest first.
+
+## [1.1.0] - 2026-10-20
+
+This release turns ContextCall into a live interview copilot powered by
+Claude, and adds a native, Neural Engine speech engine on Apple Silicon Macs.
 
 ### Claude brain
 
@@ -41,9 +46,14 @@ Format: `## [Unreleased]
 
 - **whisper-rs is the default engine** - in-process, no Python or server, small
   model download.
-- **FluidAudio (macOS, Apple Silicon)** - Parakeet TDT on the Neural Engine via
-  a Swift helper, with speaker labels; honors the transcription language and
-  offers an English-only v2 model.
+- **FluidAudio voice engine (macOS, Apple Silicon)** - Parakeet TDT running on
+  the Apple Neural Engine through a bundled Swift helper, so transcription is
+  fast and on-device with no Python or server and little CPU/GPU load.
+  - Multilingual v3 model by default, plus an English-only v2 model.
+  - Speaker labels from on-device diarization.
+  - Honors the transcription language, pinning English output for `en-*`
+    locales so v3 doesn't drift between languages.
+  - Models download on first use; select it in Settings → Engines.
 
 ### Fixes
 
