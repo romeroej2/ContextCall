@@ -1,7 +1,9 @@
 // AI Providers settings section (LLM mode, language model, embeddings).
 // Extracted from SettingsView.tsx (EP0007 / US0029).
 
+import { useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { colors, typography, spacing } from "../../theme";
 import type { ApiKeys, AppSettings, CodexUsageSummary, LlamaServerStatus } from "../../types";
 import type { SettingsStyles } from "./settingsStyles";
@@ -68,6 +70,28 @@ export function AiProvidersSection({
   onToggleAdvanced,
 }: AiProvidersSectionProps) {
   const isClaudeCliMode = settings.llmProvider === "claude-cli";
+  const isAnthropicApiMode = settings.llmProvider === "anthropic-api";
+  const [anthropicApiStatus, setAnthropicApiStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const [isCheckingAnthropicApi, setIsCheckingAnthropicApi] = useState(false);
+
+  const checkAnthropicApi = async () => {
+    setIsCheckingAnthropicApi(true);
+    setAnthropicApiStatus(null);
+    try {
+      const message = await invoke<string>("check_anthropic_api", {
+        baseUrl: settings.anthropicApiBaseUrl,
+        authMode: settings.anthropicApiAuthMode,
+        model: settings.anthropicApiModel,
+        apiKey: apiKeys.anthropicApiKey,
+      });
+      setAnthropicApiStatus({ ok: true, message });
+    } catch (e) {
+      setAnthropicApiStatus({ ok: false, message: String(e) });
+    } finally {
+      setIsCheckingAnthropicApi(false);
+    }
+  };
+
   return (
     <div>
       {/* Mode Selection */}
@@ -131,7 +155,20 @@ export function AiProvidersSection({
             </div>
           </div>
           <div
-            style={styles.aiModeCard(!isLocalMode && !isCodexCliMode && !isClaudeCliMode && !isGemmaLocalMode)}
+            style={styles.aiModeCard(isAnthropicApiMode)}
+            onClick={() =>
+              applyImmediateSettings({
+                llmProvider: "anthropic-api",
+              })
+            }
+          >
+            <div style={styles.aiModeTitle}>Anthropic API</div>
+            <div style={styles.aiModeDesc}>
+              Uses Claude through the Anthropic Messages API with your Console API key. Embeddings stay on the provider configured below.
+            </div>
+          </div>
+          <div
+            style={styles.aiModeCard(!isLocalMode && !isCodexCliMode && !isClaudeCliMode && !isAnthropicApiMode && !isGemmaLocalMode)}
             onClick={() =>
               applyImmediateSettings({
                 llmProvider: "openrouter",
@@ -325,6 +362,84 @@ export function AiProvidersSection({
               <span style={{ fontSize: typography.sm, color: colors.textMuted, marginTop: 4, display: "block" }}>
                 Ledger: {codexUsage?.ledgerPath ?? "No usage recorded yet."}
               </span>
+            </div>
+          </>
+        ) : isAnthropicApiMode ? (
+          <>
+            <div style={styles.fieldWrap}>
+              <label style={styles.labelStyle}>Anthropic API Key</label>
+              <div style={{ display: "flex", gap: spacing[2], alignItems: "flex-start" }}>
+                <input
+                  type="password"
+                  value={apiKeys.anthropicApiKey}
+                  onChange={(e) => {
+                    setAnthropicApiStatus(null);
+                    setApiKeys({ ...apiKeys, anthropicApiKey: e.target.value });
+                  }}
+                  onBlur={() => void commitApiKeysDraft()}
+                  onKeyDown={(e) => handleTextFieldCommitKeyDown(e, commitApiKeysDraft)}
+                  style={styles.inputStyle}
+                  placeholder="sk-ant-..."
+                />
+                <button
+                  style={styles.buttonSecondary}
+                  onClick={() => void checkAnthropicApi()}
+                  disabled={isCheckingAnthropicApi}
+                >
+                  {isCheckingAnthropicApi ? "Checking..." : "Check"}
+                </button>
+              </div>
+              {anthropicApiStatus && (
+                <div
+                  style={{
+                    ...styles.statusBadge(anthropicApiStatus.ok ? "success" : "error"),
+                    marginTop: spacing[2],
+                  }}
+                >
+                  <span>{anthropicApiStatus.message}</span>
+                </div>
+              )}
+              <span style={{ fontSize: typography.sm, color: colors.textMuted, marginTop: 4, display: "block" }}>
+                Stored in the OS keychain. Use an API key from the Anthropic Console; Claude.ai / Claude Code subscription logins are not supported.
+              </span>
+            </div>
+            <LabeledTextField
+              styles={styles}
+              label="Model"
+              value={settings.anthropicApiModel}
+              onChange={(v) => {
+                setAnthropicApiStatus(null);
+                setSettings({ ...settings, anthropicApiModel: v });
+              }}
+              onCommit={commitSettingsDraft}
+              placeholder="claude-sonnet-5-5"
+              hint="e.g. claude-sonnet-5-5, claude-haiku-5-5, claude-opus-5-5"
+            />
+            <LabeledTextField
+              styles={styles}
+              label="Base URL"
+              value={settings.anthropicApiBaseUrl}
+              onChange={(v) => {
+                setAnthropicApiStatus(null);
+                setSettings({ ...settings, anthropicApiBaseUrl: v });
+              }}
+              onCommit={commitSettingsDraft}
+              placeholder="https://api.anthropic.com"
+              hint="Change only to use an Anthropic-compatible gateway."
+            />
+            <div style={styles.fieldWrap}>
+              <label style={styles.labelStyle}>Auth Header</label>
+              <select
+                value={settings.anthropicApiAuthMode}
+                onChange={(e) => {
+                  setAnthropicApiStatus(null);
+                  void applyImmediateSettings({ anthropicApiAuthMode: e.target.value });
+                }}
+                style={styles.selectStyle}
+              >
+                <option value="x-api-key">x-api-key (Anthropic API)</option>
+                <option value="bearer">Authorization: Bearer (gateway)</option>
+              </select>
             </div>
           </>
         ) : settings.llmProvider === "openrouter" ? (

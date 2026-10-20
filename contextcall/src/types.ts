@@ -91,6 +91,9 @@ export interface AppSettings {
   interviewResumePath: string | null;
   interviewJobDescription: string;
   interviewExtraContext: string;
+  anthropicApiBaseUrl: string;
+  anthropicApiAuthMode: string;
+  anthropicApiModel: string;
 }
 
 export type InterviewTier = "fast" | "deep";
@@ -123,6 +126,7 @@ export interface ApiKeys {
   openAiLlmApiKey: string;
   openAiEmbedApiKey: string;
   huggingFaceToken: string;
+  anthropicApiKey: string;
 }
 
 export interface CodexUsageSummary {

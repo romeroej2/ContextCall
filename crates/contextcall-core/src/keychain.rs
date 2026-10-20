@@ -51,6 +51,9 @@ impl KeyEntry {
     pub fn hugging_face_token() -> Self {
         Self::new("huggingFaceToken")
     }
+    pub fn anthropic_api_key() -> Self {
+        Self::new("anthropicApiKey")
+    }
 
     pub fn save(&self, value: &str) -> Result<(), keyring::Error> {
         self.entry.set_password(value)

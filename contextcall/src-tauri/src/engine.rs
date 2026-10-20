@@ -153,6 +153,8 @@ pub struct ApiKeysPayload {
     pub open_ai_llm_api_key: String,
     pub open_ai_embed_api_key: String,
     pub hugging_face_token: String,
+    #[serde(default)]
+    pub anthropic_api_key: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -2227,6 +2229,39 @@ async fn complete_with_http_provider(
     .await
 }
 
+fn anthropic_api_config(
+    settings: &AppSettings,
+    api_key: String,
+) -> contextcall_core::intelligence::anthropic_client::AnthropicConfig {
+    use contextcall_core::intelligence::anthropic_client::{
+        AnthropicAuth, AnthropicConfig, DEFAULT_MODEL,
+    };
+    let model = settings.anthropic_api_model.trim();
+    let model = if model.is_empty() { DEFAULT_MODEL } else { model };
+    AnthropicConfig {
+        base_url: settings.anthropic_api_base_url.trim().to_string(),
+        ..AnthropicConfig::new(
+            AnthropicAuth::from_mode(&settings.anthropic_api_auth_mode, api_key),
+            model,
+        )
+    }
+}
+
+async fn complete_with_anthropic_api(
+    settings: &AppSettings,
+    messages: Vec<Message>,
+    max_tokens: u32,
+) -> Result<String, String> {
+    let api_key = keychain::KeyEntry::anthropic_api_key()
+        .load()
+        .unwrap_or_default();
+    let config = contextcall_core::intelligence::anthropic_client::AnthropicConfig {
+        max_tokens,
+        ..anthropic_api_config(settings, api_key)
+    };
+    contextcall_core::intelligence::anthropic_client::one_shot(&config, &messages).await
+}
+
 /// Resolve the llama-server config from settings, erroring when assets are missing.
 fn llama_server_config(settings: &AppSettings) -> Result<llama_server::LlamaServerConfig, String> {
     llama_server::assets_status()
@@ -2253,6 +2288,9 @@ async fn complete_with_settings(
     request_kind: LlmRequestKind,
 ) -> Result<String, String> {
     ensure_llama_for_provider(settings, &settings.llm_provider).await?;
+    if settings.llm_provider == "anthropic-api" {
+        return complete_with_anthropic_api(settings, messages, max_tokens).await;
+    }
     match resolve_llm_provider(settings) {
         ResolvedLlmProvider::ClaudeCli => {
             complete_with_claude_cli(settings, messages, request_kind).await
@@ -3108,6 +3146,52 @@ pub async fn check_codex_cli(path: String) -> Result<String, String> {
     }
 }
 
+/// Smoke-test the Anthropic Messages API. Unset arguments fall back to the
+/// saved settings / keychain, so unsaved edits in the UI can be checked.
+#[tauri::command]
+pub async fn check_anthropic_api(
+    base_url: Option<String>,
+    auth_mode: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+) -> Result<String, String> {
+    let mut settings = AppSettings::load();
+    if let Some(base_url) = base_url {
+        settings.anthropic_api_base_url = base_url;
+    }
+    if let Some(auth_mode) = auth_mode {
+        settings.anthropic_api_auth_mode = auth_mode;
+    }
+    if let Some(model) = model {
+        settings.anthropic_api_model = model;
+    }
+    let api_key = api_key
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| keychain::KeyEntry::anthropic_api_key().load())
+        .unwrap_or_default();
+    let config = contextcall_core::intelligence::anthropic_client::AnthropicConfig {
+        max_tokens: 16,
+        ..anthropic_api_config(&settings, api_key)
+    };
+    let started = Instant::now();
+    let text = contextcall_core::intelligence::anthropic_client::one_shot(
+        &config,
+        &[Message::user("Reply with exactly: OK")],
+    )
+    .await?;
+    let normalized = text.trim().trim_end_matches('.');
+    let elapsed_ms = started.elapsed().as_millis();
+    if normalized == "OK" {
+        Ok(format!("{} answered in {elapsed_ms}ms. Smoke test passed.", config.model))
+    } else {
+        Err(format!(
+            "{} answered, but returned `{}` instead of `OK`.",
+            config.model,
+            text.trim()
+        ))
+    }
+}
+
 #[tauri::command]
 pub fn get_codex_usage_summary() -> Result<CodexUsageSummary, String> {
     let path = codex_usage_ledger_path();
@@ -3205,6 +3289,9 @@ pub fn get_api_keys() -> ApiKeysPayload {
             .load()
             .or_else(|| settings.hugging_face_token)
             .unwrap_or_default(),
+        anthropic_api_key: keychain::KeyEntry::anthropic_api_key()
+            .load()
+            .unwrap_or_default(),
     }
 }
 
@@ -3227,6 +3314,9 @@ pub fn save_api_keys(
         .map_err(|e| e.to_string())?;
     keychain::KeyEntry::hugging_face_token()
         .save_or_delete(&new_keys.hugging_face_token)
+        .map_err(|e| e.to_string())?;
+    keychain::KeyEntry::anthropic_api_key()
+        .save_or_delete(&new_keys.anthropic_api_key)
         .map_err(|e| e.to_string())?;
     let mut settings = AppSettings::load();
     settings.hugging_face_token = if new_keys.hugging_face_token.trim().is_empty() {
@@ -4895,7 +4985,7 @@ async fn generate_notes_for_session(
             }
         })
         .await
-    } else if settings.llm_provider == "codex-cli" {
+    } else if settings.llm_provider == "codex-cli" || settings.llm_provider == "anthropic-api" {
         let messages =
             notes_engine::build_notes_messages(&records, &template, &settings.transcription_locale);
         let markdown =

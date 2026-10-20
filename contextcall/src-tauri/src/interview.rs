@@ -5,6 +5,9 @@
 //! Both keep the whole interview as context, so follow-ups make sense. A new
 //! question interrupts whatever is still streaming.
 
+use contextcall_core::intelligence::anthropic_client::{
+    self, AnthropicAuth, AnthropicConfig, AnthropicSession,
+};
 use contextcall_core::intelligence::claude_client::{ClaudeCliConfig, ClaudeCliSession};
 use contextcall_core::intelligence::conversation::{ContentBlock, ConversationSession, TurnEvent};
 use contextcall_core::intelligence::interview_engine::{
@@ -109,6 +112,53 @@ fn claude_config(
     }
 }
 
+/// Interview model settings hold CLI aliases; the Messages API needs full ids.
+fn api_model_id(model: &str) -> String {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "haiku" => "claude-haiku-5-5".into(),
+        "sonnet" => "claude-sonnet-5-5".into(),
+        "opus" => "claude-opus-5-5".into(),
+        "" => anthropic_client::DEFAULT_MODEL.into(),
+        _ => model.trim().to_string(),
+    }
+}
+
+/// Same tiers over the Anthropic Messages API (Console key from the keychain).
+/// Thinking and web search are CLI-only options and are not used here.
+fn anthropic_config(settings: &AppSettings, tier: Tier, language: &str) -> Result<AnthropicConfig, String> {
+    let key = contextcall_core::keychain::KeyEntry::anthropic_api_key()
+        .load()
+        .filter(|key| !key.trim().is_empty())
+        .ok_or("Add your Anthropic API key in Settings → AI → Anthropic API")?;
+    let role = CopilotRole::from_setting(&settings.interview_role);
+    let (model, system_prompt, max_tokens) = match tier {
+        Tier::Fast => (
+            &settings.interview_fast_model,
+            interview_engine::fast_system_prompt(language, role),
+            600,
+        ),
+        Tier::Deep => (
+            &settings.interview_deep_model,
+            interview_engine::deep_system_prompt(language, role),
+            1500,
+        ),
+    };
+    let base_url = settings.anthropic_api_base_url.trim();
+    Ok(AnthropicConfig {
+        base_url: if base_url.is_empty() {
+            anthropic_client::DEFAULT_BASE_URL.into()
+        } else {
+            base_url.to_string()
+        },
+        system_prompt,
+        max_tokens,
+        ..AnthropicConfig::new(
+            AnthropicAuth::from_mode(&settings.anthropic_api_auth_mode, key),
+            api_model_id(model),
+        )
+    })
+}
+
 async fn spawn_session(
     settings: &AppSettings,
     workspace: PathBuf,
@@ -116,7 +166,10 @@ async fn spawn_session(
 ) -> Result<Arc<dyn ConversationSession>, String> {
     let language = settings.transcription_locale.clone();
     match settings.interview_backend.as_str() {
-        // Further transports (e.g. the Anthropic API) plug in here behind ConversationSession.
+        "anthropic-api" => {
+            let session = AnthropicSession::new(anthropic_config(settings, tier, &language)?);
+            Ok(Arc::new(session) as Arc<dyn ConversationSession>)
+        }
         _ => {
             let config = claude_config(settings, workspace, tier, &language);
             let session = ClaudeCliSession::spawn(&config).await?;

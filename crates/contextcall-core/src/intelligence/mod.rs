@@ -1,3 +1,4 @@
+pub mod anthropic_client;
 pub mod claude_client;
 pub mod codex_client;
 pub mod conversation;

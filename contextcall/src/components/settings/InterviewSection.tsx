@@ -16,6 +16,11 @@ interface InterviewSectionProps {
   commitSettingsDraft: () => Promise<boolean>;
 }
 
+const BACKENDS = [
+  { value: "claude-cli", label: "Claude CLI — your Claude login (recommended)" },
+  { value: "anthropic-api", label: "Anthropic API — Console API key" },
+] as const;
+
 const FAST_MODELS = [
   { value: "haiku", label: "Haiku — fastest, ~0.8 s to first words (recommended)" },
   { value: "sonnet", label: "Sonnet — richer answers at ~1 s" },
@@ -169,13 +174,27 @@ export function InterviewSection({
 
       <div style={styles.section}>
         <h4 style={styles.sectionTitle}>Brain</h4>
-        <ClaudeCliCheck
-          settings={settings}
+        <LabeledSelect
           styles={styles}
-          setSettings={setSettings}
-          commitSettingsDraft={commitSettingsDraft}
-          model={settings.interviewFastModel}
+          label="Connection"
+          value={settings.interviewBackend}
+          options={BACKENDS}
+          onChange={(v) => applyImmediateSettings({ interviewBackend: v })}
+          hint={
+            settings.interviewBackend === "anthropic-api"
+              ? "Uses the API key, base URL and auth mode from Settings → AI → Anthropic API. Thinking and web search below apply to the Claude CLI only."
+              : undefined
+          }
         />
+        {settings.interviewBackend !== "anthropic-api" && (
+          <ClaudeCliCheck
+            settings={settings}
+            styles={styles}
+            setSettings={setSettings}
+            commitSettingsDraft={commitSettingsDraft}
+            model={settings.interviewFastModel}
+          />
+        )}
         <LabeledSelect
           styles={styles}
           label="Quick Answer Model"

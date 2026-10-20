@@ -11,9 +11,12 @@ Format: `## [Unreleased]
   suggestions share one warm conversation per recording session, so each one
   builds on the previous ones instead of starting from zero. Notes and
   auto-summaries stream through Claude too.
+- **Anthropic API provider** - "Anthropic API" AI mode using a Console API key
+  (stored in the OS keychain) with a configurable base URL and auth header for
+  compatible gateways; streaming, prompt caching and multi-turn history.
 - **Shared conversation interface** - `ConversationSession` abstracts
-  persistent multi-turn backends, so the Claude CLI and the Anthropic API
-  (in progress on its own branch) are interchangeable.
+  persistent multi-turn backends, so interview mode can run over the Claude
+  CLI or the Anthropic API (Settings → Interview → Connection).
 
 ### Interview mode
 
