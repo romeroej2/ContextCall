@@ -126,7 +126,9 @@ mod macos_impl {
     // ── SCStreamOutputTrait ───────────────────────────────────────────────────
 
     struct AudioSampleHandler {
-        tx: mpsc::Sender<Vec<f32>>,
+        // Dropped once `finished` fires so the ReceiverStream ends; the SCStream
+        // itself is leaked, so holding the sender forever would hang stop.
+        tx: Mutex<Option<mpsc::Sender<Vec<f32>>>>,
         finished: Arc<AtomicBool>,
         level: Arc<Mutex<f32>>,
         channels: u32,
@@ -142,8 +144,12 @@ mod macos_impl {
                 return;
             }
             if self.finished.load(Ordering::Relaxed) {
+                self.tx.lock().unwrap().take(); // close the channel
                 return;
             }
+            let Some(tx) = self.tx.lock().unwrap().clone() else {
+                return;
+            };
 
             let samples = extract_samples(&sample_buffer, self.channels);
             if samples.is_empty() {
@@ -153,7 +159,7 @@ mod macos_impl {
             let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
             *self.level.lock().unwrap() = rms;
 
-            self.tx.blocking_send(samples).ok();
+            tx.blocking_send(samples).ok();
         }
     }
 
@@ -220,7 +226,7 @@ mod macos_impl {
             let (tx, rx) = mpsc::channel::<Vec<f32>>(200);
 
             let handler = AudioSampleHandler {
-                tx,
+                tx: Mutex::new(Some(tx)),
                 finished: self.finished.clone(),
                 level: self.level.clone(),
                 channels: TARGET_CHANNELS,
