@@ -4,6 +4,22 @@ All notable changes to ContextCall are documented here.
 
 Format: `## [version] - date`, newest first.
 
+## [1.1.1] - 2026-10-26
+
+### Fixes
+
+- **Spanish transcription on the FluidAudio engine (macOS)** - long stretches
+  of speech are cut every ~3 s for low latency, and Parakeet v3 drifted toward
+  English at each cut, so Spanish came out as look-alike nonsense ("equipo de
+  ciencia" for "equipo de cinco"). Each cut is now decoded with the preceding
+  audio as context and stitched by word timing, so transcripts match an uncut
+  decode while finals still arrive every ~3 s for interview mode.
+
+### Docs
+
+- README section for Interview & Consultant mode: setup, roles, and how the
+  quick and depth answers work.
+
 ## [1.1.0] - 2026-10-20
 
 This release turns ContextCall into a live interview copilot powered by
