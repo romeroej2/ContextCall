@@ -172,6 +172,20 @@ impl FluidAudioWorker {
             .to_string())
     }
 
+    /// Like `transcribe`, but returns per-word timings for `SeamStitcher`.
+    pub fn transcribe_words(&mut self, samples: &[f32]) -> Result<Vec<Word>, String> {
+        let mut payload = json!({
+            "command": "transcribe",
+            "samples_b64": encode_samples(samples),
+        });
+        if !self.language.is_empty() && self.language != "auto" {
+            payload["language"] = self.language.clone().into();
+        }
+        let response = self.send_request(payload)?;
+        serde_json::from_value(response["words"].clone())
+            .map_err(|e| format!("FluidAudio helper returned no word timings: {e}"))
+    }
+
     /// Returns "speaker_N" (0-based) or None when the audio is too short to embed.
     pub fn speaker_id(&mut self, samples: &[f32]) -> Result<Option<String>, String> {
         let response = self.send_request(json!({
@@ -286,6 +300,108 @@ where
     });
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct Word {
+    pub text: String,
+    /// Seconds from the start of the decoded window.
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Stitches VAD segments that were force-cut mid-speech.
+///
+/// Parakeet v3 decodes every call from a fresh state, so a hard 3 s cut lands
+/// mid-word and the decoder drifts to its English prior at the seam (Spanish
+/// comes out as look-alike nonsense). Instead each segment is decoded with the
+/// audio before it as context, words already emitted are skipped by time, and
+/// the last `HOLDBACK_S` seconds (where a word may be cut) wait for the next
+/// segment unless speech ended at a pause. Latency stays at the VAD cadence.
+#[derive(Default)]
+pub struct SeamStitcher {
+    /// Audio of the current utterance still needed as context or not yet emitted.
+    carry: Vec<f32>,
+    /// Seconds into `carry` up to which words were already emitted.
+    committed: f64,
+    /// Last emitted words, to drop repeats when timings shift between passes.
+    tail: Vec<String>,
+}
+
+impl SeamStitcher {
+    const SAMPLE_RATE: f64 = 16_000.0;
+    const CONTEXT_S: f64 = 4.0;
+    const HOLDBACK_S: f64 = 1.5;
+    /// Stay inside Parakeet's single 15 s encoder window.
+    const MAX_WINDOW_S: f64 = 14.0;
+    const TAIL_WORDS: usize = 4;
+
+    /// The audio to decode for `samples`: carried context plus the new segment.
+    pub fn window(&mut self, samples: &[f32]) -> Vec<f32> {
+        let mut audio = std::mem::take(&mut self.carry);
+        audio.extend_from_slice(samples);
+        audio
+    }
+
+    /// Takes the decoded `window` and returns the text to emit now.
+    pub fn accept(&mut self, window: Vec<f32>, words: &[Word], continues: bool) -> String {
+        let duration = window.len() as f64 / Self::SAMPLE_RATE;
+        let limit = if continues && duration < Self::MAX_WINDOW_S {
+            duration - Self::HOLDBACK_S
+        } else {
+            f64::INFINITY
+        };
+        let mut fresh: Vec<&Word> = Vec::new();
+        for word in words {
+            if (word.start + word.end) / 2.0 < self.committed {
+                continue;
+            }
+            if word.end > limit {
+                break;
+            }
+            fresh.push(word);
+        }
+
+        let mut texts: Vec<&str> = fresh.iter().map(|w| w.text.as_str()).collect();
+        let max_overlap = Self::TAIL_WORDS.min(texts.len()).min(self.tail.len());
+        for k in (1..=max_overlap).rev() {
+            let repeated = self.tail[self.tail.len() - k..]
+                .iter()
+                .zip(&texts[..k])
+                .all(|(a, b)| normalize(a) == normalize(b));
+            if repeated {
+                texts.drain(..k);
+                break;
+            }
+        }
+        let text = texts.join(" ");
+
+        if !continues {
+            *self = Self::default();
+            return text;
+        }
+        if let Some(last) = fresh.last() {
+            self.committed = last.end;
+        } else if limit.is_infinite() {
+            self.committed = duration;
+        }
+        self.tail.extend(texts.iter().map(|t| t.to_string()));
+        let excess = self.tail.len().saturating_sub(Self::TAIL_WORDS);
+        self.tail.drain(..excess);
+
+        let drop_s = (self.committed - Self::CONTEXT_S).max(0.0);
+        let drop = ((drop_s * Self::SAMPLE_RATE) as usize).min(window.len());
+        self.carry = window[drop..].to_vec();
+        self.committed -= drop as f64 / Self::SAMPLE_RATE;
+        text
+    }
+}
+
+fn normalize(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +460,62 @@ mod tests {
         assert!(worker.transcribe(&silence).unwrap().is_empty());
         assert_eq!(worker.speaker_id(&silence[..8_000]).unwrap(), None);
         worker.clear_speakers().unwrap();
+    }
+
+    fn word(text: &str, start: f64, end: f64) -> Word {
+        Word {
+            text: text.into(),
+            start,
+            end,
+        }
+    }
+
+    fn secs(s: f64) -> Vec<f32> {
+        vec![0.0; (s * 16_000.0) as usize]
+    }
+
+    #[test]
+    fn stitcher_holds_back_the_cut_and_skips_emitted_words() {
+        let mut stitcher = SeamStitcher::default();
+        let audio = stitcher.window(&secs(3.0));
+        let words = [word("Buenos", 0.1, 0.5), word("días,", 0.5, 1.0), word("gra", 2.6, 3.0)];
+        assert_eq!(stitcher.accept(audio, &words, true), "Buenos días,");
+
+        // The window now starts with the first 3 s as context.
+        let audio = stitcher.window(&secs(3.0));
+        assert_eq!(audio.len(), secs(6.0).len());
+        let words = [
+            word("Buenos", 0.1, 0.5),
+            word("días,", 0.5, 1.0),
+            word("gracias", 2.6, 3.2),
+            word("por", 3.3, 3.5),
+        ];
+        assert_eq!(stitcher.accept(audio, &words, false), "gracias por");
+        // A pause resets the context.
+        assert_eq!(stitcher.window(&secs(1.0)).len(), secs(1.0).len());
+    }
+
+    #[test]
+    fn stitcher_drops_words_repeated_after_timing_shift() {
+        let mut stitcher = SeamStitcher::default();
+        let audio = stitcher.window(&secs(3.0));
+        let words = [word("trabajando", 0.2, 1.0), word("como", 1.0, 1.4)];
+        assert_eq!(stitcher.accept(audio, &words, true), "trabajando como");
+
+        let audio = stitcher.window(&secs(3.0));
+        // "como" re-decoded slightly later, so its midpoint passes the time filter.
+        let words = [word("como", 1.3, 1.7), word("ingeniero", 1.8, 2.4)];
+        assert_eq!(stitcher.accept(audio, &words, false), "ingeniero");
+    }
+
+    #[test]
+    fn stitcher_keeps_window_inside_parakeet_limit() {
+        let mut stitcher = SeamStitcher::default();
+        for _ in 0..10 {
+            let audio = stitcher.window(&secs(3.0));
+            assert!(audio.len() <= secs(SeamStitcher::MAX_WINDOW_S + 3.0).len());
+            // Noise: no words recognized, so nothing is ever committed by words.
+            stitcher.accept(audio, &[], true);
+        }
     }
 }

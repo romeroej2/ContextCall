@@ -63,6 +63,22 @@ impl SegmentationParams {
     }
 }
 
+/// VAD output. `continues` marks a forced cut mid-speech (the flush cap), as
+/// opposed to a segment closed by a pause.
+struct Segment {
+    samples: Vec<f32>,
+    continues: bool,
+}
+
+impl Segment {
+    fn ended(samples: Vec<f32>) -> Self {
+        Self {
+            samples,
+            continues: false,
+        }
+    }
+}
+
 pub struct StreamingTranscriber {
     on_final: OnFinal,
     backend: SttBackend,
@@ -279,7 +295,7 @@ impl StreamingTranscriber {
     {
         use futures::StreamExt;
 
-        let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(30);
+        let (seg_tx, seg_rx) = mpsc::sync_channel::<Segment>(30);
         let on_final = self.on_final;
         let on_volatile = self.on_volatile;
         let on_progress = self.on_progress;
@@ -327,7 +343,7 @@ impl StreamingTranscriber {
                                     return;
                                 }
                             };
-                            for samples in seg_rx.iter() {
+                            for Segment { samples, .. } in seg_rx.iter() {
                                 let text =
                                     crate::transcription::whisper::WhisperManager::transcribe(
                                         &mut state, &samples, &language,
@@ -351,7 +367,7 @@ impl StreamingTranscriber {
                     match crate::transcription::faster_whisper::FasterWhisperWorker::spawn(&config)
                     {
                         Ok(mut worker) => {
-                            for samples in seg_rx.iter() {
+                            for Segment { samples, .. } in seg_rx.iter() {
                                 match worker.transcribe(&samples, &language) {
                                     Ok(text) if !text.is_empty() => {
                                         if let Some(ref on_progress) = progress_for_backend {
@@ -419,7 +435,7 @@ impl StreamingTranscriber {
                             // is too short for a reliable embedding (avoids "Speaker A").
                             let mut last_speaker_id: Option<String> = None;
 
-                            for samples in seg_rx.iter() {
+                            for Segment { samples, .. } in seg_rx.iter() {
                                 if diarization_enabled {
                                     diarization_buf.extend_from_slice(&samples);
                                     if diarization_buf.len() > DIARIZATION_BUF_SAMPLES {
@@ -503,7 +519,7 @@ impl StreamingTranscriber {
                             if let Err(e) = worker.ensure_model() {
                                 log::error!("omni-asr ensure_model failed: {e}");
                             }
-                            for samples in seg_rx.iter() {
+                            for Segment { samples, .. } in seg_rx.iter() {
                                 match worker.transcribe(&samples, &language) {
                                     Ok(text) if !text.is_empty() => {
                                         if let Some(ref on_progress) = progress_for_backend {
@@ -552,7 +568,7 @@ impl StreamingTranscriber {
                                 log::error!("cohere-transcribe ensure_model failed: {e}");
                                 return;
                             }
-                            for samples in seg_rx.iter() {
+                            for Segment { samples, .. } in seg_rx.iter() {
                                 match worker.transcribe(&samples, &language) {
                                     Ok(text) if !text.is_empty() => {
                                         if let Some(ref on_progress) = progress_for_backend {
@@ -590,7 +606,7 @@ impl StreamingTranscriber {
                         log::error!("llama-server STT unavailable: {e}");
                         return;
                     }
-                    for samples in seg_rx.iter() {
+                    for Segment { samples, .. } in seg_rx.iter() {
                         match crate::llama_server::transcribe_segment_blocking(
                             &base_url, &samples, &language,
                         ) {
@@ -633,8 +649,13 @@ impl StreamingTranscriber {
                         }
                     }
                     let mut window = SpeakerWindow::default();
-                    for samples in seg_rx.iter() {
-                        match worker.transcribe(&samples) {
+                    let mut stitcher = crate::transcription::fluid_audio::SeamStitcher::default();
+                    for Segment { samples, continues } in seg_rx.iter() {
+                        let audio = stitcher.window(&samples);
+                        let result = worker
+                            .transcribe_words(&audio)
+                            .map(|words| stitcher.accept(audio, &words, continues));
+                        match result {
                             Ok(text) if !text.is_empty() => {
                                 if let Some(ref on_progress) = progress_for_backend {
                                     on_progress(SegmentProgress::Processed);
@@ -721,7 +742,7 @@ impl StreamingTranscriber {
                         active_start_count = 0;
                         pending_speech_buf.clear();
                         if speech_buf.len() > seg_params.min_speech_samples {
-                            match seg_tx.try_send(std::mem::take(&mut speech_buf)) {
+                            match seg_tx.try_send(Segment::ended(std::mem::take(&mut speech_buf))) {
                                 Ok(_) => {
                                     if let Some(ref on_progress) = on_progress {
                                         on_progress(SegmentProgress::Captured);
@@ -741,7 +762,11 @@ impl StreamingTranscriber {
                 }
 
                 if speaking && speech_buf.len() >= seg_params.flush_samples {
-                    match seg_tx.try_send(std::mem::take(&mut speech_buf)) {
+                    let segment = Segment {
+                        samples: std::mem::take(&mut speech_buf),
+                        continues: true,
+                    };
+                    match seg_tx.try_send(segment) {
                         Ok(_) => {
                             if let Some(ref on_progress) = on_progress {
                                 on_progress(SegmentProgress::Captured);
@@ -774,7 +799,7 @@ impl StreamingTranscriber {
 
         // Flush remainder
         if speech_buf.len() > seg_params.min_speech_samples {
-            if seg_tx.send(speech_buf).is_ok() {
+            if seg_tx.send(Segment::ended(speech_buf)).is_ok() {
                 if let Some(ref on_progress) = on_progress {
                     on_progress(SegmentProgress::Captured);
                 }
@@ -961,5 +986,46 @@ mod tests {
             window.tag(&[0.0; 10], |_| Err("boom".into())),
             Some("speaker_2".into())
         );
+    }
+
+    /// Plays raw 16 kHz f32 PCM through VAD + FluidAudio in real time, printing each
+    /// final with its arrival time:
+    /// CONTEXTCALL_FLUIDAUDIO_HELPER=<helper> CONTEXTCALL_FLUIDAUDIO_PCM=<file.f32> \
+    ///   CONTEXTCALL_FLUIDAUDIO_LANG=es cargo test -p contextcall-core fluid_audio_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn fluid_audio_live_stitching() {
+        let (Some(helper), Some(pcm)) = (
+            std::env::var_os("CONTEXTCALL_FLUIDAUDIO_HELPER"),
+            std::env::var_os("CONTEXTCALL_FLUIDAUDIO_PCM"),
+        ) else {
+            return;
+        };
+        let bytes = std::fs::read(pcm).unwrap();
+        let samples: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let language = std::env::var("CONTEXTCALL_FLUIDAUDIO_LANG").unwrap_or_default();
+        let config = crate::transcription::fluid_audio::FluidAudioConfig {
+            helper_path: helper.into(),
+            runtime_root: tempfile::tempdir().unwrap().keep(),
+            model: crate::transcription::fluid_audio::DEFAULT_MODEL.into(),
+            language: language.clone(),
+            diarization_enabled: false,
+        };
+        let started = std::time::Instant::now();
+        let on_final = Box::new(move |text: String, _: Option<String>| {
+            println!("[{:5.1}s] {text}", started.elapsed().as_secs_f64());
+        });
+        let chunks: Vec<Vec<f32>> = samples.chunks(1600).map(|c| c.to_vec()).collect();
+        let paced = stream::unfold(chunks.into_iter(), |mut it| async move {
+            let chunk = it.next()?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Some((chunk, it))
+        });
+        StreamingTranscriber::new(SttBackend::FluidAudio(config), language, on_final)
+            .run(paced)
+            .await;
     }
 }

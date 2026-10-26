@@ -5,7 +5,8 @@
 // Commands:
 //   health
 //   ensure_model   {model: "v3"|"ultra", asr: bool, diarization: bool}
-//   transcribe     {samples_b64, language?} -> {text}   (language: ISO 639-1, e.g. "en")
+//   transcribe     {samples_b64, language?} -> {text, words: [{text, start, end}]}
+//                  (language: ISO 639-1, e.g. "en"; word times in seconds from the start)
 //   speaker_id     {samples_b64}            -> {speaker_id: "speaker_N" | null}
 //   clear_speakers
 //   shutdown
@@ -87,16 +88,35 @@ func ensureModel(_ payload: [String: Any]) async throws {
 }
 
 @MainActor
-func transcribe(_ samples: [Float], language: Language?) async throws -> String {
+func transcribe(_ samples: [Float], language: Language?) async throws -> ASRResult {
     guard let asr = asrManager else {
         throw NSError(
             domain: "contextcall-fluidaudio", code: 2,
             userInfo: [NSLocalizedDescriptionKey: "ASR model not loaded; call ensure_model first"])
     }
     var state = TdtDecoderState.make(decoderLayers: await asr.decoderLayerCount)
-    // The hint filters decoder tokens to the language's script (and blocks
-    // non-English tokens for "en"), stopping v3 from drifting between languages.
-    return try await asr.transcribe(samples, decoderState: &state, language: language).text
+    // The hint filters decoder tokens to the language's script (plus an
+    // English-token blocklist for "fr"). It does not separate Spanish from
+    // English, which share a script, so segment length matters more there.
+    return try await asr.transcribe(samples, decoderState: &state, language: language)
+}
+
+/// Groups sub-word tokens into words (a leading space starts a new word) so the
+/// caller can stitch overlapping windows by time.
+func words(_ timings: [TokenTiming]) -> [[String: Any]] {
+    var words: [[String: Any]] = []
+    for timing in timings {
+        let piece = timing.token
+        if piece.hasPrefix(" ") || words.isEmpty {
+            let text = piece.trimmingCharacters(in: .whitespaces)
+            if text.isEmpty { continue }
+            words.append(["text": text, "start": timing.startTime, "end": timing.endTime])
+        } else {
+            words[words.count - 1]["text"] = (words[words.count - 1]["text"] as? String ?? "") + piece
+            words[words.count - 1]["end"] = timing.endTime
+        }
+    }
+    return words
 }
 
 @MainActor
@@ -133,7 +153,8 @@ while let line = readLine(strippingNewline: true) {
             ok(["model": asrVersionName ?? "", "diarization": diarizer != nil])
         case "transcribe":
             let language = (payload["language"] as? String).flatMap(Language.init(rawValue:))
-            ok(["text": try await transcribe(try decodeSamples(payload), language: language)])
+            let result = try await transcribe(try decodeSamples(payload), language: language)
+            ok(["text": result.text, "words": words(result.tokenTimings ?? [])])
         case "speaker_id":
             if let id = try speakerId(try decodeSamples(payload)) {
                 ok(["speaker_id": id])
