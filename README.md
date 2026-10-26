@@ -48,6 +48,12 @@ Found a bug or have an idea? [Open an issue](https://github.com/romeroej2/Contex
 - **Auto summaries while you talk** - generate periodic summaries (30 seconds to 10 minutes), review summary history, and regenerate on demand.
 - **Contextual talking points** - when the conversation hits a key moment, ContextCall retrieves related knowledge and suggests useful responses.
 
+### Interview & consultant copilot
+
+- **Live answers to questions as they're asked** - when the other side asks something, ContextCall streams a short first-person answer you can start saying within about a second, plus a deeper research answer to glance at while you talk.
+- **Two roles** - *Interview* when you're the candidate (grounded in your resume and the job description), *Consultant* for client calls, workshops, sales and technical discussions.
+- **Ask anytime** - type your own question, or press **Answer** for what was just said. See [Interview & Consultant Mode](#interview--consultant-mode).
+
 ### Knowledge and note workflows
 
 - **Obsidian vault integration** - connect a local Obsidian vault, choose which folders feed suggestions, and publish canonical meeting notes back into the vault.
@@ -177,6 +183,32 @@ The app will detect missing prerequisites automatically and show guided setup st
 3. In **Settings -> General**, either connect a local Obsidian vault or point ContextCall at a legacy folder of `.md` or `.txt` files.
 4. Optional: in **Settings -> General -> Audio & Capture**, switch **Mic Capture Mode** to **Push to talk** and record a shortcut if you only want your mic forwarded while a trigger is held.
 5. Click **Start Session** to go live. If push-to-talk is enabled, use the live **Hold to talk** control in the capture panel or your configured shortcut while the app window is focused. *(The first run downloads the required local Whisper speech model.)*
+
+---
+
+## Interview & Consultant Mode
+
+Interview mode turns ContextCall into a live copilot. It listens for questions from the other side of the call and answers them right away, using Claude.
+
+### Setup
+
+1. Open **Settings -> Interview** and check **Enable interview mode**.
+2. Pick a **Connection**: **Claude CLI** (your local `claude` login, recommended; ContextCall never reads its credentials) or **Anthropic API** (a Console API key stored in the OS keychain).
+3. Pick a **Copilot Role**:
+   - **Interview - I'm the candidate**: add your resume (PDF, Markdown or text; PDFs go to Claude as-is, so layout and tables are kept), the job description, and any notes for the copilot (stories to emphasize, things to avoid, preferred stack).
+   - **Consultant - expert assistant for any call**: drops the candidate framing. Add context about yourself and the engagement or client instead.
+4. Optional: choose the **Quick Answer Model** (Haiku by default, first words in about a second) and enable **Add a deeper answer** with a **Depth Model** (Opus by default), optional thinking and web search.
+5. Set the transcription language to the language of the call (for example `es-MX` for Spanish). Answers come back in that language; English locales always answer in English.
+
+### How it works
+
+- **Question detection** - question marks and openers like "walk me through...", "tell me about...", and their Spanish equivalents trigger an answer the moment they are transcribed. Small talk is ignored.
+- **Two tiers** - the quick tier gives a one-line answer to start speaking with plus a few bullets in the order to say them. The depth tier adds concepts, trade-offs, numbers, pitfalls, a code or architecture sketch when useful, and one sharp point to raise.
+- **Keeps context** - both tiers remember the whole call, so follow-ups ("why?", "what about at scale?") make sense and stay consistent with what you already said. A new question interrupts an answer that is still streaming.
+- **Grounded, not invented** - answers never make up employers, titles, numbers or facts about you or your company that aren't in your resume or notes.
+- **Ask anytime** - type a question to get a direct knowledge answer (works even without recording), or press **Answer** to answer what the other side just said.
+
+Answers appear in the interview workspace beside the live transcript. On Apple Silicon Macs, the **FluidAudio** engine (Settings -> Engines) gives fast on-device transcription in English and Spanish, so questions reach the copilot within a few seconds of being spoken.
 
 ---
 
