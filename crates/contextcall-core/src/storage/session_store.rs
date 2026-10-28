@@ -1,5 +1,5 @@
 use crate::models::{
-    EnhancedNotes, SessionIndex, SessionRecord, SessionSidecar, SuggestionFeedbackEntry,
+    EnhancedNotes, SessionIndex, SessionRecord, SessionSidecar, Speaker, SuggestionFeedbackEntry,
 };
 use chrono::{DateTime, Utc};
 use serde_json;
@@ -63,6 +63,45 @@ impl SessionStore {
             sidecar.index.utterance_count = self.current_utterance_count;
             self.write_sidecar(&sidecar);
         }
+        Ok(())
+    }
+
+    /// Rewrites remote speaker labels in the active session after diarization
+    /// re-clusters. `changes` holds (position among "them" records, participant id,
+    /// participant label); other lines are kept byte for byte.
+    pub fn relabel_them_records(
+        &mut self,
+        changes: &[(usize, String, String)],
+    ) -> Result<(), String> {
+        let id = self.current_id.clone().ok_or("no active session")?;
+        let path = self.sessions_dir.join(format!("{}.jsonl", id));
+        let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let mut out = String::with_capacity(text.len());
+        let mut them = 0;
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let mut kept = line.to_string();
+            if let Ok(mut record) = serde_json::from_str::<SessionRecord>(line) {
+                if matches!(record.speaker, Speaker::Them) {
+                    if let Some((_, pid, label)) = changes.iter().find(|c| c.0 == them) {
+                        record.participant_id = Some(pid.clone());
+                        record.participant_label = Some(label.clone());
+                        kept = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+                    }
+                    them += 1;
+                }
+            }
+            out.push_str(&kept);
+            out.push('\n');
+        }
+        let tmp = path.with_extension("jsonl.tmp");
+        fs::write(&tmp, out).map_err(|e| e.to_string())?;
+        fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        self.current_file = Some(
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?,
+        );
         Ok(())
     }
 
@@ -241,7 +280,6 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Speaker;
     use tempfile::tempdir;
 
     #[test]
@@ -284,6 +322,42 @@ mod tests {
         assert_eq!(records[0].text, "hello");
         assert_eq!(sessions[0].utterance_count, 1);
         assert!(sessions[0].ended_at.is_some());
+    }
+
+    #[test]
+    fn relabel_rewrites_only_the_named_them_records() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::new(dir.path().to_path_buf());
+        store.start_session();
+        let record = |speaker: Speaker, label: &str| SessionRecord {
+            speaker,
+            participant_id: Some(label.to_lowercase()),
+            participant_label: Some(label.into()),
+            text: "hi".into(),
+            timestamp: Utc::now(),
+            suggestions: None,
+            kb_hits: None,
+            suggestion_decision: None,
+            surfaced_suggestion_text: None,
+            conversation_state_summary: None,
+        };
+        store.append_record(&record(Speaker::Them, "Speaker 1")).unwrap();
+        store.append_record(&record(Speaker::You, "You")).unwrap();
+        store.append_record(&record(Speaker::Them, "Speaker 3")).unwrap();
+        store
+            .relabel_them_records(&[(1, "speaker_0".into(), "Speaker 1".into())])
+            .unwrap();
+        // Appending still works after the rewrite.
+        store.append_record(&record(Speaker::Them, "Speaker 2")).unwrap();
+        let id = store.current_session_id().unwrap().to_string();
+        store.end_session();
+
+        let labels: Vec<_> = store
+            .load_transcript(&id)
+            .into_iter()
+            .map(|r| r.participant_label.unwrap())
+            .collect();
+        assert_eq!(labels, ["Speaker 1", "You", "Speaker 1", "Speaker 2"]);
     }
 
     #[test]

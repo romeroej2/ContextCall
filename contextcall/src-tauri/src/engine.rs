@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -141,6 +141,17 @@ fn emit_overlay_suggestion(window: WebviewWindow, payload: SuggestionPayload) {
 pub struct TranscriptPayload {
     pub text: String,
     pub speaker: String,
+    pub participant_id: String,
+    pub participant_label: String,
+    /// Position among this session's remote finals; `speakers-relabeled` refers to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<usize>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerRelabelPayload {
+    pub seq: usize,
     pub participant_id: String,
     pub participant_label: String,
 }
@@ -1951,6 +1962,34 @@ fn resolve_transcription_language(settings: &AppSettings, model: &str) -> String
     }
 }
 
+/// Applies a diarization re-cluster: updates the live transcript and the saved session.
+fn relabel_them_speakers(app: &AppHandle, state: &AppState, changes: Vec<(usize, String)>) {
+    let changes: Vec<SpeakerRelabelPayload> = changes
+        .into_iter()
+        .map(|(seq, id)| {
+            let (participant_id, participant_label) = speaker_id_to_label(&id);
+            SpeakerRelabelPayload {
+                seq,
+                participant_id,
+                participant_label,
+            }
+        })
+        .collect();
+    app.emit("speakers-relabeled", &changes).ok();
+    let records: Vec<_> = changes
+        .into_iter()
+        .map(|c| (c.seq, c.participant_id, c.participant_label))
+        .collect();
+    if let Err(e) = state
+        .session_store
+        .lock()
+        .unwrap()
+        .relabel_them_records(&records)
+    {
+        log::warn!("[diarization] failed to save relabelled speakers: {e}");
+    }
+}
+
 /// Maps a Python worker speaker ID (e.g. "speaker_0") to a (participant_id, participant_label) pair.
 /// Falls back to ("remote_1", "Speaker A") for unrecognised formats.
 fn speaker_id_to_label(id: &str) -> (String, String) {
@@ -3658,7 +3697,12 @@ pub fn start_transcription(
             let app_sg = them_app.clone();
             let state_sg = Arc::clone(&them_state);
 
+            // Counts every final, kept or not, so positions match the transcriber's
+            // relabel positions.
+            let them_finals = Arc::new(AtomicUsize::new(0));
+            let them_finals_seen = Arc::clone(&them_finals);
             let on_them = move |text: String, speaker_id: Option<String>| {
+                let seq = them_finals_seen.fetch_add(1, Ordering::Relaxed);
                 if !*state_sg.is_running.lock().unwrap() {
                     return;
                 }
@@ -3682,6 +3726,7 @@ pub fn start_transcription(
                     speaker: "them".into(),
                     participant_id: participant_id.clone(),
                     participant_label: participant_label.clone(),
+                    seq: Some(seq),
                 };
                 app_sg.emit("transcript", &payload).ok();
 
@@ -3731,6 +3776,7 @@ pub fn start_transcription(
                             speaker: "them".into(),
                             participant_id: "remote_1".into(),
                             participant_label: "Speaker A".into(),
+                            seq: None,
                         },
                     )
                     .ok();
@@ -3752,6 +3798,8 @@ pub fn start_transcription(
                 }
                 emit_transcription_progress(&progress_app_them, &progress_state_them);
             });
+            let relabel_app = them_app.clone();
+            let relabel_state = Arc::clone(&them_state);
             let mut transcriber =
                 StreamingTranscriber::new(them_backend, them_lang, Box::new(on_them))
                     .with_volatile(Box::new(on_them_vol))
@@ -3759,7 +3807,10 @@ pub fn start_transcription(
                     .with_stop_signal(Arc::clone(&them_state.stop_requested))
                     .with_diarization(settings.diarization_enabled)
                     .with_clear_speakers_on_start(true)
-                    .with_speaker_tagger(them_speaker_tagger);
+                    .with_speaker_tagger(them_speaker_tagger)
+                    .with_speaker_relabel(Box::new(move |changes| {
+                        relabel_them_speakers(&relabel_app, &relabel_state, changes)
+                    }));
             if let Some(worker) = warmed_sys {
                 transcriber = transcriber.with_parakeet_worker(worker);
             }
@@ -4046,6 +4097,7 @@ pub fn start_transcription(
                 speaker: "you".into(),
                 participant_id: "you".into(),
                 participant_label: "You".into(),
+                seq: None,
             };
             app_y.emit("transcript", &payload).ok();
             let utterance = contextcall_core::models::Utterance {
@@ -4103,6 +4155,7 @@ pub fn start_transcription(
                         speaker: "you".into(),
                         participant_id: "you".into(),
                         participant_label: "You".into(),
+                        seq: None,
                     },
                 )
                 .ok();
@@ -4267,6 +4320,7 @@ pub async fn start_import_transcription(
                 speaker: "you".into(),
                 participant_id: "you".into(),
                 participant_label: "You".into(),
+                seq: None,
             };
             app_f.emit("transcript", &payload).ok();
             let record = SessionRecord {

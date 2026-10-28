@@ -60,6 +60,14 @@ interface TranscriptPayload {
   speaker: string;
   participantId?: string;
   participantLabel?: string;
+  /** Position among the session's remote finals; relabels refer to it. */
+  seq?: number;
+}
+
+export interface SpeakerRelabel {
+  seq: number;
+  participantId: string;
+  participantLabel: string;
 }
 
 interface SuggestionPayload {
@@ -123,6 +131,10 @@ const EMPTY_STATE: LiveSessionState = {
 
 class LiveSessionStore {
   private state: LiveSessionState = EMPTY_STATE;
+  /** Unmerged finals, kept so a speaker relabel can re-run the bubble merge. */
+  private segments: Utterance[] = [];
+  /** Index into `segments` of each remote final, by its backend `seq`. */
+  private themSegmentBySeq = new Map<number, number>();
   private listeners = new Set<Listener>();
 
   subscribe = (listener: Listener) => {
@@ -147,6 +159,8 @@ class LiveSessionStore {
   }
 
   resetSession = () => {
+    this.segments = [];
+    this.themSegmentBySeq.clear();
     this.commit({
       ...EMPTY_STATE,
       audioLevels: this.state.audioLevels.micTransmitActive
@@ -158,6 +172,8 @@ class LiveSessionStore {
   };
 
   replaceTranscript = (utterances: Utterance[]) => {
+    this.segments = utterances;
+    this.themSegmentBySeq.clear();
     this.update((current) => ({
       ...current,
       utterances: mergeUtterances(utterances),
@@ -171,19 +187,43 @@ class LiveSessionStore {
 
   addTranscriptUtterance = (payload: TranscriptPayload) => {
     const speaker = payload.speaker === "you" ? "you" : "them";
+    const segment: Utterance = {
+      id: crypto.randomUUID(),
+      text: payload.text,
+      speaker,
+      participantId: payload.participantId || null,
+      participantLabel: payload.participantLabel || null,
+      timestamp: new Date().toISOString(),
+    };
+    if (speaker === "them" && payload.seq !== undefined) {
+      this.themSegmentBySeq.set(payload.seq, this.segments.length);
+    }
+    this.segments = [...this.segments, segment];
     this.update((current) => ({
       ...current,
-      utterances: appendMerged(current.utterances, {
-        id: crypto.randomUUID(),
-        text: payload.text,
-        speaker,
-        participantId: payload.participantId || null,
-        participantLabel: payload.participantLabel || null,
-        timestamp: new Date().toISOString(),
-      }),
+      utterances: appendMerged(current.utterances, segment),
       volatileYouText: speaker === "you" ? "" : current.volatileYouText,
       volatileThemText: speaker === "them" ? "" : current.volatileThemText,
     }));
+  };
+
+  /** Diarization re-clustered the session: fix earlier speakers and re-merge bubbles. */
+  relabelSpeakers = (changes: SpeakerRelabel[]) => {
+    const segments = [...this.segments];
+    let changed = false;
+    for (const change of changes) {
+      const index = this.themSegmentBySeq.get(change.seq);
+      if (index === undefined) continue;
+      segments[index] = {
+        ...segments[index],
+        participantId: change.participantId,
+        participantLabel: change.participantLabel,
+      };
+      changed = true;
+    }
+    if (!changed) return;
+    this.segments = segments;
+    this.update((current) => ({ ...current, utterances: mergeUtterances(segments) }));
   };
 
   setVolatileTranscript = (speaker: SpeakerKey, text: string) => {

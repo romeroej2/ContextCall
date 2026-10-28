@@ -5,6 +5,7 @@ import {
   liveSessionStore,
   type InterviewAnswerPayload,
   type InterviewQuestionPayload,
+  type SpeakerRelabel,
 } from "./useLiveSessionStore";
 
 type SuggestionCheckEvent = {
@@ -20,8 +21,13 @@ export function useLiveSessionSubscriptions() {
         speaker: string;
         participantId?: string;
         participantLabel?: string;
+        seq?: number;
       }>("transcript", (event) => {
         liveSessionStore.addTranscriptUtterance(event.payload);
+      }),
+
+      listen<SpeakerRelabel[]>("speakers-relabeled", (event) => {
+        liveSessionStore.relabelSpeakers(event.payload);
       }),
 
       listen<{ text: string; speaker: string }>("transcript-volatile", (event) => {
