@@ -329,11 +329,13 @@ export function TranscriptView({
   const bottomRef = useRef<HTMLDivElement>(null);
   const highlightedRef = useRef<HTMLDivElement>(null);
 
+  // Segments merge into the last bubble, so follow its text growth too, not just the count.
+  const lastTextLength = utterances[utterances.length - 1]?.text.length ?? 0;
   useEffect(() => {
     if (!searchQuery) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [utterances.length, searchQuery]);
+  }, [utterances.length, lastTextLength, searchQuery]);
 
   useEffect(() => {
     if (searchResults.length > 0 && highlightedRef.current) {

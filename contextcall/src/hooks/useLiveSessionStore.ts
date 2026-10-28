@@ -8,6 +8,7 @@ import type {
   TranscriptionProgress,
   Utterance,
 } from "../types";
+import { appendMerged, mergeUtterances } from "../transcriptMerge";
 
 type SpeakerKey = "you" | "them";
 
@@ -159,7 +160,7 @@ class LiveSessionStore {
   replaceTranscript = (utterances: Utterance[]) => {
     this.update((current) => ({
       ...current,
-      utterances,
+      utterances: mergeUtterances(utterances),
       suggestions: [],
       volatileYouText: "",
       volatileThemText: "",
@@ -172,17 +173,14 @@ class LiveSessionStore {
     const speaker = payload.speaker === "you" ? "you" : "them";
     this.update((current) => ({
       ...current,
-      utterances: [
-        ...current.utterances,
-        {
-          id: crypto.randomUUID(),
-          text: payload.text,
-          speaker,
-          participantId: payload.participantId || null,
-          participantLabel: payload.participantLabel || null,
-          timestamp: new Date().toISOString(),
-        },
-      ],
+      utterances: appendMerged(current.utterances, {
+        id: crypto.randomUUID(),
+        text: payload.text,
+        speaker,
+        participantId: payload.participantId || null,
+        participantLabel: payload.participantLabel || null,
+        timestamp: new Date().toISOString(),
+      }),
       volatileYouText: speaker === "you" ? "" : current.volatileYouText,
       volatileThemText: speaker === "them" ? "" : current.volatileThemText,
     }));

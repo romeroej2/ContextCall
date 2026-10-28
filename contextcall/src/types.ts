@@ -7,6 +7,8 @@ export interface Utterance {
   participantId?: string | null;
   participantLabel?: string | null;
   timestamp: string;
+  /** Arrival time of the last segment folded into this bubble. */
+  endTimestamp?: string;
 }
 
 export interface Suggestion {
