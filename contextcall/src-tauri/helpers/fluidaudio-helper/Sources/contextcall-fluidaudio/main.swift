@@ -7,7 +7,10 @@
 //   ensure_model   {model: "v3"|"ultra", asr: bool, diarization: bool}
 //   transcribe     {samples_b64, language?} -> {text, words: [{text, start, end}]}
 //                  (language: ISO 639-1, e.g. "en"; word times in seconds from the start)
-//   speaker_id     {samples_b64}            -> {speaker_id: "speaker_N" | null}
+//   speaker_id     {samples_b64}            -> {speaker_id: "speaker_N" | null, index: Int | null}
+//                  (index: position of this embedding in the session history, for recluster)
+//   recluster      {threshold?}             -> {speaker_ids: ["speaker_N" | null, ...]}
+//                  (one label per history index, from clustering the whole session at once)
 //   clear_speakers
 //   shutdown
 //
@@ -17,11 +20,22 @@ import Foundation
 import FluidAudio
 
 let minSpeakerIdSamples = 16_000  // 1.0 s at 16 kHz, same floor as the Python worker
+// Clips shorter than this give noisy embeddings: they may match a known speaker but
+// never start a new one or move a speaker's centroid. Most spurious "Speaker N"
+// labels came from short clips landing just outside every centroid.
+let minNewSpeakerSeconds: Float = 2.0
+// Max average cosine distance at which recluster joins two groups of embeddings.
+let reclusterThreshold: Float = 0.45
 
 var asrManager: AsrManager?
 var asrVersionName: String?
 var diarizer: DiarizerManager?
-var speakers = SpeakerManager()
+var speakers = SpeakerManager(minSpeechDuration: minNewSpeakerSeconds)
+// Every embedding taken this session with its live label, so recluster can revisit
+// early decisions once more of each voice has been heard.
+var history: [(embedding: [Float], seconds: Float, liveId: String?)] = []
+// Online speaker id -> name chosen by the last recluster.
+var aliases: [String: String] = [:]
 
 func log(_ message: String) {
     FileHandle.standardError.write(Data("[fluidaudio] \(message)\n".utf8))
@@ -120,19 +134,118 @@ func words(_ timings: [TokenTiming]) -> [[String: Any]] {
 }
 
 @MainActor
-func speakerId(_ samples: [Float]) throws -> String? {
-    guard samples.count >= minSpeakerIdSamples else { return nil }
+func speakerId(_ samples: [Float]) throws -> (id: String?, index: Int?) {
+    guard samples.count >= minSpeakerIdSamples else { return (nil, nil) }
     guard let diarizer else {
         throw NSError(
             domain: "contextcall-fluidaudio", code: 3,
             userInfo: [NSLocalizedDescriptionKey: "diarizer not loaded; call ensure_model with diarization"])
     }
     let embedding = try diarizer.extractSpeakerEmbedding(from: samples)
-    let duration = Float(samples.count) / 16_000
-    guard let speaker = speakers.assignSpeaker(embedding, speechDuration: duration) else { return nil }
-    // SpeakerManager ids are 1-based ("1", "2", …); the engine expects "speaker_<0-based>".
-    if let n = Int(speaker.id) { return "speaker_\(n - 1)" }
-    return "speaker_\(speaker.id)"
+    let seconds = Float(samples.count) / 16_000
+    let speaker: Speaker?
+    if seconds < minNewSpeakerSeconds {
+        speaker = speakers.findSpeaker(with: embedding).id.flatMap { speakers.getSpeaker(for: $0) }
+    } else {
+        speaker = speakers.assignSpeaker(embedding, speechDuration: seconds)
+    }
+    let id = speaker.map { engineId($0.id) }
+    history.append((embedding, seconds, id))
+    return (id.map { aliases[$0] ?? $0 }, history.count - 1)
+}
+
+/// SpeakerManager ids are 1-based ("1", "2", …); the engine expects "speaker_<0-based>".
+func engineId(_ id: String) -> String {
+    if let n = Int(id) { return "speaker_\(n - 1)" }
+    return "speaker_\(id)"
+}
+
+/// Average-linkage agglomerative clustering over the session's embeddings. Long clips
+/// form the clusters; short ones join the nearest. Clusters keep the live label they
+/// overlap most so bubbles only change where the live pass got it wrong, and later
+/// live labels follow the same naming through `aliases`.
+@MainActor
+func recluster(threshold: Float) -> [String?] {
+    let anchors = history.indices.filter { history[$0].seconds >= minNewSpeakerSeconds }
+    let n = anchors.count
+    // Pairwise distances between clusters, updated in place (Lance-Williams) so a
+    // long session stays O(n²) memory and a few hundred ms per pass.
+    var dist = [Float](repeating: 0, count: n * n)
+    for a in 0..<n {
+        for b in (a + 1)..<n {
+            let d = SpeakerUtilities.cosineDistance(
+                history[anchors[a]].embedding, history[anchors[b]].embedding)
+            dist[a * n + b] = d
+            dist[b * n + a] = d
+        }
+    }
+    var members: [[Int]?] = anchors.map { [$0] }
+    while true {
+        var best: (a: Int, b: Int, d: Float) = (0, 0, .infinity)
+        for a in 0..<n where members[a] != nil {
+            for b in (a + 1)..<n where members[b] != nil && dist[a * n + b] < best.d {
+                best = (a, b, dist[a * n + b])
+            }
+        }
+        guard best.d <= threshold, let sa = members[best.a]?.count, let sb = members[best.b]?.count
+        else { break }
+        for k in 0..<n where members[k] != nil && k != best.a && k != best.b {
+            let d = (Float(sa) * dist[k * n + best.a] + Float(sb) * dist[k * n + best.b]) / Float(sa + sb)
+            dist[k * n + best.a] = d
+            dist[best.a * n + k] = d
+        }
+        members[best.a]! += members[best.b]!
+        members[best.b] = nil
+    }
+    let clusters = members.compactMap { $0 }
+
+    var cluster = [Int?](repeating: nil, count: history.count)
+    for (c, group) in clusters.enumerated() { for i in group { cluster[i] = c } }
+    let centroids = clusters.map { group -> [Float] in
+        var sum = [Float](repeating: 0, count: history[group[0]].embedding.count)
+        for i in group {
+            let e = history[i].embedding
+            let norm = max(sqrt(e.reduce(0) { $0 + $1 * $1 }), 1e-9)
+            for d in sum.indices { sum[d] += e[d] / norm }
+        }
+        return sum
+    }
+    for i in history.indices where cluster[i] == nil && !clusters.isEmpty {
+        cluster[i] = centroids.indices.min {
+            SpeakerUtilities.cosineDistance(history[i].embedding, centroids[$0])
+                < SpeakerUtilities.cosineDistance(history[i].embedding, centroids[$1])
+        }
+    }
+
+    // Name clusters after the live label holding the most speech in them, biggest first.
+    var overlap: [Int: [String: Float]] = [:]
+    var seconds = [Float](repeating: 0, count: clusters.count)
+    for (i, entry) in history.enumerated() {
+        guard let c = cluster[i] else { continue }
+        seconds[c] += entry.seconds
+        if let live = entry.liveId { overlap[c, default: [:]][live, default: 0] += entry.seconds }
+    }
+    var names: [Int: String] = [:]
+    var taken = Set<String>()
+    var next = (history.compactMap { $0.liveId.flatMap { Int($0.dropFirst("speaker_".count)) } }.max() ?? -1) + 1
+    for c in clusters.indices.sorted(by: { seconds[$0] > seconds[$1] }) {
+        if let live = overlap[c]?.filter({ !taken.contains($0.key) }).max(by: { $0.value < $1.value })?.key {
+            names[c] = live
+        } else {
+            names[c] = "speaker_\(next)"
+            next += 1
+        }
+        taken.insert(names[c]!)
+    }
+
+    // Live ids from the online pass map to the cluster that holds most of their speech.
+    var votes: [String: [String: Float]] = [:]
+    for (i, entry) in history.enumerated() {
+        guard let live = entry.liveId, let name = cluster[i].flatMap({ names[$0] }) else { continue }
+        votes[live, default: [:]][name, default: 0] += entry.seconds
+    }
+    aliases = votes.compactMapValues { $0.max(by: { $0.value < $1.value })?.key }
+    return cluster.map { $0.flatMap { names[$0] } }
 }
 
 while let line = readLine(strippingNewline: true) {
@@ -156,13 +269,15 @@ while let line = readLine(strippingNewline: true) {
             let result = try await transcribe(try decodeSamples(payload), language: language)
             ok(["text": result.text, "words": words(result.tokenTimings ?? [])])
         case "speaker_id":
-            if let id = try speakerId(try decodeSamples(payload)) {
-                ok(["speaker_id": id])
-            } else {
-                ok(["speaker_id": NSNull()])
-            }
+            let (id, index) = try speakerId(try decodeSamples(payload))
+            ok(["speaker_id": id ?? NSNull(), "index": index ?? NSNull()])
+        case "recluster":
+            let threshold = (payload["threshold"] as? Double).map(Float.init) ?? reclusterThreshold
+            ok(["speaker_ids": recluster(threshold: threshold).map { $0 ?? NSNull() as Any }])
         case "clear_speakers":
             speakers.reset()
+            history.removeAll()
+            aliases.removeAll()
             ok(["cleared": true])
         case "shutdown":
             ok(["status": "bye"])

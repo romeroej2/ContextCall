@@ -98,6 +98,14 @@ pub struct FluidAudioWorker {
     language: String,
 }
 
+/// A speaker ID from the helper. `index` is the embedding's slot in the session
+/// history that `recluster` labels; None when the audio was too short to embed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SpeakerMatch {
+    pub speaker_id: Option<String>,
+    pub index: Option<usize>,
+}
+
 impl FluidAudioWorker {
     pub fn spawn(config: &FluidAudioConfig) -> Result<Self, String> {
         Self::spawn_with_log(config, |_| {})
@@ -186,13 +194,25 @@ impl FluidAudioWorker {
             .map_err(|e| format!("FluidAudio helper returned no word timings: {e}"))
     }
 
-    /// Returns "speaker_N" (0-based) or None when the audio is too short to embed.
-    pub fn speaker_id(&mut self, samples: &[f32]) -> Result<Option<String>, String> {
+    /// Returns "speaker_N" (0-based), or no ID when the audio is too short to embed
+    /// or too short to start a new speaker.
+    pub fn speaker_id(&mut self, samples: &[f32]) -> Result<SpeakerMatch, String> {
         let response = self.send_request(json!({
             "command": "speaker_id",
             "samples_b64": encode_samples(samples),
         }))?;
-        Ok(response["speaker_id"].as_str().map(|s| s.to_string()))
+        Ok(SpeakerMatch {
+            speaker_id: response["speaker_id"].as_str().map(|s| s.to_string()),
+            index: response["index"].as_u64().map(|i| i as usize),
+        })
+    }
+
+    /// Re-clusters every embedding taken since `clear_speakers` and returns one
+    /// label per `SpeakerMatch::index`. Later `speaker_id` calls follow the new naming.
+    pub fn recluster(&mut self) -> Result<Vec<Option<String>>, String> {
+        let response = self.send_request(json!({ "command": "recluster" }))?;
+        serde_json::from_value(response["speaker_ids"].clone())
+            .map_err(|e| format!("FluidAudio helper returned no speaker ids: {e}"))
     }
 
     pub fn clear_speakers(&mut self) -> Result<(), String> {
@@ -458,7 +478,11 @@ mod tests {
         worker.ensure_model(true, true).unwrap();
         let silence = vec![0.0f32; 32_000];
         assert!(worker.transcribe(&silence).unwrap().is_empty());
-        assert_eq!(worker.speaker_id(&silence[..8_000]).unwrap(), None);
+        assert_eq!(
+            worker.speaker_id(&silence[..8_000]).unwrap(),
+            SpeakerMatch::default()
+        );
+        assert!(worker.recluster().unwrap().is_empty());
         worker.clear_speakers().unwrap();
     }
 
