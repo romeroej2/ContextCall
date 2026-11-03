@@ -4,7 +4,7 @@
   <img src="assets/contextcall_logo.png" width="128" alt="ContextCall Logo" />
 </p>
 
-**A meeting note-taker that talks back - now on Windows and Mac.**
+**A local-first desktop meeting assistant for Windows, macOS and Linux.**
 
 > **Acknowledgement:** ContextCall builds on groundwork from [OpenOats](https://github.com/yazinsai/OpenOats) by [yazinsai](https://github.com/yazinsai) and its successor OpenCassava. It is now a standalone project with its own roadmap, focused on cross-platform support and live-call intelligence.
 
@@ -22,9 +22,15 @@
   </a>
 </p>
 
-ContextCall sits next to your call, transcribes both sides of the conversation in real time, and searches your own notes to surface talking points right when you need them.
+ContextCall transcribes both speakers in a call in real time. It grounds its suggestions in your own notes and documents, so what it shows comes from material you wrote. Privacy comes first. With LM Studio or Ollama, the models run on your computer, and your audio, transcripts and notes stay there.
 
-For first-time setup with LM Studio, start here: [LM Studio Setup Guide](docs/lm-studio-setup.md). ContextCall can also use the local Codex CLI as the LLM backend for suggestions and notes when you want to use your ChatGPT/Codex subscription.
+- **Local models.** Language models and embeddings run through LM Studio or Ollama on your own machine. The Codex CLI and cloud providers are optional backends you can choose in Settings.
+- **Two-speaker transcription.** On Windows and macOS it captures your microphone and system audio as separate speakers, with echo cancellation so speaker sound does not bleed into your mic.
+- **Retrieval over your notes.** It indexes chosen Obsidian folders or a folder of Markdown and text files with embeddings, and shows the source note behind each suggestion.
+- **Interview practice.** Rehearse answers grounded in your own resume and the job description before the real conversation.
+- **Cross-platform releases.** The project's own GitHub Actions pipeline builds installers for Windows (EXE, MSI), macOS (DMG) and Linux (DEB) on every tagged release.
+
+For first-time setup with LM Studio, start here: [LM Studio Setup Guide](docs/lm-studio-setup.md).
 
 <p align="center">
   <img src="assets/image.png" width="360" alt="ContextCall during a call - suggestions drawn from your own notes appear at the top, live transcript below" />
@@ -41,17 +47,16 @@ Found a bug or have an idea? [Open an issue](https://github.com/romeroej2/Contex
 
 ### During a live call
 
-- **Invisible to the other side** - the overlay window is hidden from screen sharing by default, so no one knows you're using it.
 - **Live transcript + instant search** - see both sides of the conversation in real time, search while people are speaking, and copy/export when needed.
 - **Smarter call capture** - built-in echo cancellation suppresses speaker bleed into your mic, and a configurable mic voice threshold reduces low-level noise.
 - **Push-to-talk mic mode** - switch mic capture between always-on and push-to-talk, then hold the live trigger button or your chosen shortcut to send mic audio to transcription only while you are speaking.
 - **Auto summaries while you talk** - generate periodic summaries (30 seconds to 10 minutes), review summary history, and regenerate on demand.
 - **Contextual talking points** - when the conversation hits a key moment, ContextCall retrieves related knowledge and suggests useful responses.
 
-### Interview & consultant copilot
+### Interview practice & consultant mode
 
-- **Live answers to questions as they're asked** - when the other side asks something, ContextCall streams a short first-person answer you can start saying within about a second, plus a deeper research answer to glance at while you talk.
-- **Two roles** - *Interview* when you're the candidate (grounded in your resume and the job description), *Consultant* for client calls, workshops, sales and technical discussions.
+- **Practice answering questions** - in a mock interview with a friend or coach, ContextCall detects each question and drafts a short answer grounded in your resume, plus a deeper version you can study afterward.
+- **Two roles** - *Interview* to rehearse as the candidate (grounded in your resume and the job description), *Consultant* for client calls, workshops, sales and technical discussions.
 - **Ask anytime** - type your own question, or press **Answer** for what was just said. See [Interview & Consultant Mode](#interview--consultant-mode).
 
 ### Knowledge and note workflows
@@ -73,7 +78,7 @@ Found a bug or have an idea? [Open an issue](https://github.com/romeroej2/Contex
 
 ## Product Design
 
-ContextCall is designed for high-pressure conversations (interviews, sales calls, support escalations, technical meetings) where speed and clarity matter.
+ContextCall is designed for busy conversations (sales calls, support escalations, technical meetings) where speed and clarity matter.
 
 ### Design principles
 
@@ -188,7 +193,7 @@ The app will detect missing prerequisites automatically and show guided setup st
 
 ## Interview & Consultant Mode
 
-Interview mode turns ContextCall into a live copilot. It listens for questions from the other side of the call and answers them right away, using Claude.
+Interview mode is for practice and preparation. Run a mock interview with a friend or coach. ContextCall listens for their questions and drafts answers with Claude, grounded in your resume, so you can rehearse and refine your stories before the real interview. Consultant mode uses the same engine for client and team calls.
 
 ### Setup
 
@@ -203,7 +208,7 @@ Interview mode turns ContextCall into a live copilot. It listens for questions f
 ### How it works
 
 - **Question detection** - question marks and openers like "walk me through...", "tell me about...", and their Spanish equivalents trigger an answer the moment they are transcribed. Small talk is ignored.
-- **Two tiers** - the quick tier gives a one-line answer to start speaking with plus a few bullets in the order to say them. The depth tier adds concepts, trade-offs, numbers, pitfalls, a code or architecture sketch when useful, and one sharp point to raise.
+- **Two tiers** - the quick tier gives a one-line answer plus a few supporting bullets. The depth tier adds concepts, trade-offs, numbers, pitfalls, a code or architecture sketch when useful, and one sharp point to raise.
 - **Keeps context** - both tiers remember the whole call, so follow-ups ("why?", "what about at scale?") make sense and stay consistent with what you already said. A new question interrupts an answer that is still streaming.
 - **Grounded, not invented** - answers never make up employers, titles, numbers or facts about you or your company that aren't in your resume or notes.
 - **Ask anytime** - type a question to get a direct knowledge answer (works even without recording), or press **Answer** to answer what the other side just said.
