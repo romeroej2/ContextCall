@@ -91,6 +91,7 @@ export interface AppSettings {
   interviewDeepThinking: boolean;
   interviewDeepWebSearch: boolean;
   interviewResumePath: string | null;
+  interviewContextFolder: string | null;
   interviewJobDescription: string;
   interviewExtraContext: string;
   anthropicApiBaseUrl: string;

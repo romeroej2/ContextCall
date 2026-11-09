@@ -26,6 +26,7 @@ pub fn run() {
             engine::check_anthropic_api,
             engine::check_claude_cli,
             engine::check_interview_resume,
+            engine::check_interview_context_folder,
             engine::interview_answer_now,
             engine::get_codex_usage_summary,
             engine::get_model_path,

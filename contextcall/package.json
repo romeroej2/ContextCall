@@ -9,7 +9,9 @@
     "lint": "eslint --max-warnings=0 --cache --cache-location .eslintcache \"src/**/*.{ts,tsx}\" \"scripts/**/*.mjs\" \"eslint.config.js\"",
     "lint:fix": "npm run lint -- --fix",
     "preview": "vite preview",
-    "tauri": "node ./scripts/run-tauri.mjs"
+    "tauri": "node ./scripts/run-tauri.mjs",
+    "install:mac": "bash ./scripts/install-mac-app.sh",
+    "install:mac:build": "bash ./scripts/install-mac-app.sh --build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",

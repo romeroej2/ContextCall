@@ -45,6 +45,7 @@ export function InterviewSection({
   commitSettingsDraft,
 }: InterviewSectionProps) {
   const [resumeStatus, setResumeStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const [folderStatus, setFolderStatus] = useState<{ ok: boolean; message: string } | null>(null);
 
   const checkResume = async (path: string) => {
     try {
@@ -55,11 +56,27 @@ export function InterviewSection({
     }
   };
 
+  const checkContextFolder = async (path: string) => {
+    try {
+      const message = await invoke<string>("check_interview_context_folder", { path });
+      setFolderStatus({ ok: true, message });
+    } catch (err) {
+      setFolderStatus({ ok: false, message: String(err) });
+    }
+  };
+
   const chooseResume = async () => {
     const path = await invoke<string | null>("choose_resume_file");
     if (!path) return;
     await applyImmediateSettings({ interviewResumePath: path });
     await checkResume(path);
+  };
+
+  const chooseContextFolder = async () => {
+    const path = await invoke<string | null>("choose_folder");
+    if (!path) return;
+    await applyImmediateSettings({ interviewContextFolder: path });
+    await checkContextFolder(path);
   };
 
   const consultant = settings.interviewRole === "consultant";
@@ -158,6 +175,39 @@ export function InterviewSection({
             }
           />
         </div>
+        {consultant && (
+          <div style={styles.fieldWrap}>
+            <label style={styles.labelStyle}>Extra Context Folder</label>
+            <div style={{ display: "flex", gap: spacing[2], alignItems: "center" }}>
+              <input
+                type="text"
+                value={settings.interviewContextFolder ?? ""}
+                onChange={(e) => {
+                  setFolderStatus(null);
+                  setSettings({ ...settings, interviewContextFolder: e.target.value || null });
+                }}
+                onBlur={() => {
+                  void commitSettingsDraft();
+                  if (settings.interviewContextFolder) void checkContextFolder(settings.interviewContextFolder);
+                }}
+                style={styles.inputStyle}
+                placeholder="Folder of Markdown, text or PDF docs"
+              />
+              <button style={styles.buttonSecondary} onClick={() => void chooseContextFolder()}>
+                Choose…
+              </button>
+            </div>
+            {folderStatus && (
+              <div style={{ ...styles.statusBadge(folderStatus.ok ? "success" : "error"), marginTop: spacing[2] }}>
+                <span>{folderStatus.message}</span>
+              </div>
+            )}
+            <FieldHint>
+              Loaded once at session start (up to 25 files, including subfolders). Use for SOWs, architecture notes,
+              runbooks, client briefs.
+            </FieldHint>
+          </div>
+        )}
         <div style={styles.fieldWrap}>
           <label style={styles.labelStyle}>Notes for the Copilot</label>
           <textarea
@@ -165,7 +215,11 @@ export function InterviewSection({
             onChange={(e) => setSettings({ ...settings, interviewExtraContext: e.target.value })}
             onBlur={() => void commitSettingsDraft()}
             style={textareaStyle}
-            placeholder="Stories to emphasize, salary expectations, things to avoid, preferred tech stack…"
+            placeholder={
+              consultant
+                ? "Things to emphasize, sensitive topics to avoid, preferred framing…"
+                : "Stories to emphasize, salary expectations, things to avoid, preferred tech stack…"
+            }
           />
         </div>
       </div>

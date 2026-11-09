@@ -3052,6 +3052,7 @@ fn interview_settings_changed(previous: &AppSettings, next: &AppSettings) -> boo
         || previous.interview_deep_thinking != next.interview_deep_thinking
         || previous.interview_deep_web_search != next.interview_deep_web_search
         || previous.interview_resume_path != next.interview_resume_path
+        || previous.interview_context_folder != next.interview_context_folder
         || previous.interview_job_description != next.interview_job_description
         || previous.interview_extra_context != next.interview_extra_context
         || previous.transcription_locale != next.transcription_locale
@@ -3066,6 +3067,15 @@ pub fn check_interview_resume(path: String) -> Result<String, String> {
         ContentBlock::Document { .. } => "PDF resume loaded — Claude reads it directly.".into(),
         ContentBlock::Text { text } => format!("Text resume loaded ({} characters).", text.chars().count()),
     })
+}
+
+/// Validate a context folder without starting a session.
+#[tauri::command]
+pub fn check_interview_context_folder(path: String) -> Result<String, String> {
+    let (_, summary) = contextcall_core::intelligence::interview_engine::load_context_folder(
+        std::path::Path::new(path.trim()),
+    )?;
+    Ok(summary.describe())
 }
 
 #[tauri::command]

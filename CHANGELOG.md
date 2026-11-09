@@ -4,6 +4,21 @@ All notable changes to ContextCall are documented here.
 
 Format: `## [version] - date`, newest first.
 
+## Unreleased
+
+### Interview / Consultant
+
+- **Extra Context Folder (consultant)** - point Settings → Interview at a folder of
+  Markdown, text or PDF docs; they load into the priming turn with your profile
+  and engagement notes (up to 25 files, including subfolders).
+
+### macOS
+
+- **Stable local installs** - `npm run install:mac` / `install:mac:build` sign
+  `/Applications/ContextCall.app` with your Apple Development certificate so mic
+  and screen-recording permissions survive rebuilds (ad-hoc signing reset them
+  every update).
+
 ## [1.1.1] - 2026-10-26
 
 ### Fixes

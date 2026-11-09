@@ -140,7 +140,24 @@ npm install
 npm run tauri -- build
 ```
 
-The installers are output to `contextcall/src-tauri/target/release/bundle/`.
+The installers are output to `target/release/bundle/` at the repo root.
+
+#### macOS local installs (keep mic / screen permissions)
+
+macOS ties Privacy permissions to the app's **code signature**. Ad-hoc builds
+(`codesign -s -`) change identity every rebuild, so Settings asks again after
+each update. Sign local installs with your Apple Development certificate instead:
+
+```bash
+# From the repo root — uses the Apple Development identity in your keychain
+npm run install:mac:build   # build + install to /Applications
+# or, if you already built the .app:
+npm run install:mac
+```
+
+Grant microphone and screen recording once after the first Development-signed
+install. Later installs with the same identity keep those grants. Override the
+identity with `APPLE_SIGNING_IDENTITY` if needed.
 
 ---
 
@@ -201,7 +218,7 @@ Interview mode is for practice and preparation. Run a mock interview with a frie
 2. Pick a **Connection**: **Claude CLI** (your local `claude` login, recommended; ContextCall never reads its credentials) or **Anthropic API** (a Console API key stored in the OS keychain).
 3. Pick a **Copilot Role**:
    - **Interview - I'm the candidate**: add your resume (PDF, Markdown or text; PDFs go to Claude as-is, so layout and tables are kept), the job description, and any notes for the copilot (stories to emphasize, things to avoid, preferred stack).
-   - **Consultant - expert assistant for any call**: drops the candidate framing. Add context about yourself and the engagement or client instead.
+   - **Consultant - expert assistant for any call**: drops the candidate framing. Add context about yourself and the engagement or client, plus an optional **Extra Context Folder** of Markdown, text or PDF docs (SOWs, architecture notes, runbooks) loaded at session start.
 4. Optional: choose the **Quick Answer Model** (Haiku by default, first words in about a second) and enable **Add a deeper answer** with a **Depth Model** (Opus by default), optional thinking and web search.
 5. Set the transcription language to the language of the call (for example `es-MX` for Spanish). Answers come back in that language; English locales always answer in English.
 

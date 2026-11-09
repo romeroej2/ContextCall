@@ -242,6 +242,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub interview_resume_path: Option<String>,
 
+    /// Folder of Markdown/text/PDF docs loaded into the copilot priming turn
+    /// (especially useful for consultant engagements).
+    #[serde(default)]
+    pub interview_context_folder: Option<String>,
+
     #[serde(default)]
     pub interview_job_description: String,
 
@@ -398,6 +403,7 @@ impl Default for AppSettings {
             interview_deep_thinking: false,
             interview_deep_web_search: false,
             interview_resume_path: None,
+            interview_context_folder: None,
             interview_job_description: String::new(),
             interview_extra_context: String::new(),
             anthropic_api_base_url: default_anthropic_api_base_url(),

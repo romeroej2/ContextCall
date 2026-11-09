@@ -7,6 +7,8 @@
     "dev": "npm --prefix ./contextcall run dev",
     "build": "npm --prefix ./contextcall run build",
     "tauri": "npm --prefix ./contextcall run tauri --",
+    "install:mac": "npm --prefix ./contextcall run install:mac",
+    "install:mac:build": "npm --prefix ./contextcall run install:mac:build",
     "lint": "npm --prefix ./contextcall run lint",
     "lint:fix": "npm --prefix ./contextcall run lint:fix"
   },

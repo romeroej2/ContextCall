@@ -188,9 +188,19 @@ pub fn load_profile(settings: &AppSettings) -> Result<InterviewProfile, String> 
         Some(path) => Some(interview_engine::load_resume(std::path::Path::new(path))?),
         None => None,
     };
+    let context_docs = match settings
+        .interview_context_folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(path) => interview_engine::load_context_folder(std::path::Path::new(path))?.0,
+        None => Vec::new(),
+    };
     Ok(InterviewProfile {
         role: CopilotRole::from_setting(&settings.interview_role),
         resume,
+        context_docs,
         job_description: settings.interview_job_description.clone(),
         extra_context: settings.interview_extra_context.clone(),
         response_language: settings.transcription_locale.clone(),

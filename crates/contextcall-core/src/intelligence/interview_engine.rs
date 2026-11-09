@@ -16,6 +16,8 @@ const MAX_PENDING_QUESTION_CHARS: usize = 600;
 const MAX_CONTEXT_LINES: usize = 40;
 const MIN_QUESTION_WORDS: usize = 3;
 const MAX_RESUME_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_CONTEXT_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_CONTEXT_FOLDER_FILES: usize = 25;
 
 /// Who the copilot sits next to.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -43,10 +45,61 @@ const DIRECT_QUESTION_LABEL: &str = "Direct question from the user:";
 pub struct InterviewProfile {
     pub role: CopilotRole,
     pub resume: Option<ContentBlock>,
+    /// Extra Markdown/text/PDF docs from a context folder (consultant engagements).
+    pub context_docs: Vec<ContentBlock>,
     pub job_description: String,
     pub extra_context: String,
     /// BCP-47 locale from transcription settings ("auto" or empty = match the interviewer).
     pub response_language: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextFolderSummary {
+    pub files: usize,
+    pub text_chars: usize,
+    pub pdfs: usize,
+    pub skipped: usize,
+}
+
+impl ContextFolderSummary {
+    pub fn describe(&self) -> String {
+        if self.files == 0 {
+            return if self.skipped > 0 {
+                format!(
+                    "Folder loaded — no usable Markdown, text or PDF files (skipped {}).",
+                    self.skipped
+                )
+            } else {
+                "Folder loaded — no Markdown, text or PDF files found.".into()
+            };
+        }
+        let mut parts = Vec::new();
+        if self.text_chars > 0 {
+            parts.push(format!("{} text characters", self.text_chars));
+        }
+        if self.pdfs > 0 {
+            parts.push(format!(
+                "{} PDF{}",
+                self.pdfs,
+                if self.pdfs == 1 { "" } else { "s" }
+            ));
+        }
+        let detail = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        };
+        let skipped = if self.skipped > 0 {
+            format!("; skipped {}", self.skipped)
+        } else {
+            String::new()
+        };
+        format!(
+            "Loaded {} context file{}{detail}{skipped}.",
+            self.files,
+            if self.files == 1 { "" } else { "s" }
+        )
+    }
 }
 
 /// Load a resume as a content block: PDFs go to Claude as documents, text formats inline.
@@ -80,6 +133,141 @@ pub fn load_resume(path: &Path) -> Result<ContentBlock, String> {
                 "Candidate resume:\n\n{}",
                 text.trim()
             )))
+        }
+    }
+}
+
+/// Load Markdown, text and PDF files from a folder into priming content blocks.
+/// Walks subfolders; skips hidden paths and unsupported types. Caps at
+/// [`MAX_CONTEXT_FOLDER_FILES`] files.
+pub fn load_context_folder(path: &Path) -> Result<(Vec<ContentBlock>, ContextFolderSummary), String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Cannot read context folder {}: {e}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a folder", path.display()));
+    }
+
+    let mut files = Vec::new();
+    collect_context_files(path, path, &mut files);
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let mut blocks = Vec::new();
+    let mut summary = ContextFolderSummary::default();
+    let mut remaining_slots = MAX_CONTEXT_FOLDER_FILES;
+
+    for (absolute, relative) in files {
+        if remaining_slots == 0 {
+            summary.skipped += 1;
+            continue;
+        }
+        match load_context_file(&absolute, &relative) {
+            Ok(file_blocks) => {
+                if file_blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Document { .. }))
+                {
+                    summary.pdfs += 1;
+                }
+                for block in &file_blocks {
+                    if let ContentBlock::Text { text } = block {
+                        summary.text_chars += text.chars().count();
+                    }
+                }
+                blocks.extend(file_blocks);
+                summary.files += 1;
+                remaining_slots -= 1;
+            }
+            Err(_) => summary.skipped += 1,
+        }
+    }
+
+    Ok((blocks, summary))
+}
+
+fn collect_context_files(root: &Path, absolute: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+    let Ok(entries) = std::fs::read_dir(absolute) else {
+        return;
+    };
+    let mut children = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    children.sort();
+
+    for child in children {
+        let name = child
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&child) else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_context_files(root, &child, out);
+            continue;
+        }
+        let extension = child
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !matches!(extension.as_str(), "md" | "markdown" | "txt" | "pdf") {
+            continue;
+        }
+        let relative = child
+            .strip_prefix(root)
+            .map(|p| {
+                p.components()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(value) => value.to_str().map(str::to_owned),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_else(|_| name.to_string());
+        out.push((child, relative));
+    }
+}
+
+fn load_context_file(path: &Path, relative: &str) -> Result<Vec<ContentBlock>, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    if metadata.len() > MAX_CONTEXT_FILE_BYTES {
+        return Err(format!("{relative} is larger than 10 MB"));
+    }
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+
+    match extension.as_str() {
+        "pdf" => Ok(vec![
+            ContentBlock::text(format!("Extra context document: {relative}")),
+            ContentBlock::Document {
+                media_type: "application/pdf".into(),
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            },
+        ]),
+        "docx" | "doc" | "pages" | "odt" => Err(format!(
+            "{relative}: save as PDF, Markdown or plain text — Word/Pages files are not supported."
+        )),
+        _ => {
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("{relative} must be UTF-8 text or Markdown"))?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(format!("{relative} is empty"));
+            }
+            Ok(vec![ContentBlock::text(format!(
+                "Extra context — {relative}:\n\n{trimmed}"
+            ))])
         }
     }
 }
@@ -202,6 +390,7 @@ pub fn priming_turn(profile: &InterviewProfile) -> Vec<ContentBlock> {
     if let Some(resume) = &profile.resume {
         blocks.push(resume.clone());
     }
+    blocks.extend(profile.context_docs.iter().cloned());
     let consultant = profile.role == CopilotRole::Consultant;
     let mut text = String::from(if consultant {
         "Context for this session.\n"
@@ -210,6 +399,11 @@ pub fn priming_turn(profile: &InterviewProfile) -> Vec<ContentBlock> {
     });
     if profile.resume.is_none() && !consultant {
         text.push_str("\nNo resume was provided; keep answers general and honest.\n");
+    }
+    if !profile.context_docs.is_empty() {
+        text.push_str(
+            "\nExtra context documents are attached above — prefer them over inventing facts.\n",
+        );
     }
     if !profile.job_description.trim().is_empty() {
         text.push_str(&format!(
@@ -709,8 +903,7 @@ mod tests {
                 "Candidate resume:\n\nJane, Rust at Acme",
             )),
             job_description: "Senior backend engineer".into(),
-            extra_context: String::new(),
-            response_language: "auto".into(),
+            ..Default::default()
         };
         let blocks = priming_turn(&profile);
         assert_eq!(blocks.len(), 2);
@@ -762,6 +955,40 @@ mod tests {
         let docx = dir.path().join("resume.docx");
         std::fs::write(&docx, b"PK").unwrap();
         assert!(load_resume(&docx).is_err());
+    }
+
+    #[test]
+    fn load_context_folder_reads_nested_docs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("client")).unwrap();
+        std::fs::write(dir.path().join("overview.md"), "# Engagement\nMigrate Rails").unwrap();
+        std::fs::write(dir.path().join("client").join("stack.txt"), "Postgres 15").unwrap();
+        std::fs::write(dir.path().join("brief.PDF"), b"%PDF-1.4 brief").unwrap();
+        std::fs::write(dir.path().join("ignore.docx"), b"PK").unwrap();
+        std::fs::write(dir.path().join(".hidden.md"), "secret").unwrap();
+
+        let (blocks, summary) = load_context_folder(dir.path()).unwrap();
+        assert_eq!(summary.files, 3);
+        assert_eq!(summary.pdfs, 1);
+        assert_eq!(summary.skipped, 0);
+        assert!(summary.describe().contains("3 context files"));
+        assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Migrate Rails"))));
+        assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Postgres 15"))));
+        assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Document { .. })));
+    }
+
+    #[test]
+    fn priming_turn_includes_context_docs() {
+        let profile = InterviewProfile {
+            role: CopilotRole::Consultant,
+            context_docs: vec![ContentBlock::text("Extra context — sow.md:\n\nPhase 1 discovery")],
+            job_description: "Acme migration".into(),
+            ..Default::default()
+        };
+        let blocks = priming_turn(&profile);
+        assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Phase 1 discovery"))));
+        assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Extra context documents are attached"))));
+        assert!(blocks.iter().any(|b| matches!(b, ContentBlock::Text { text } if text.contains("Acme migration"))));
     }
 }
 
@@ -820,8 +1047,7 @@ mod live_tests {
                  handling 40k TPS on Postgres; led migration from RabbitMQ to Kafka; mentored 4 engineers.",
             )),
             job_description: "Staff engineer, distributed systems, fintech".into(),
-            extra_context: String::new(),
-            response_language: "auto".into(),
+            ..Default::default()
         };
         let primed = Instant::now();
         complete_turn(&session, priming_turn(&profile), Duration::from_secs(90))
