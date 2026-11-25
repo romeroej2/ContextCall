@@ -1,0 +1,8 @@
+# Link the MSVC C/C++ runtime statically on Windows so ContextCall.exe (installed or
+# portable) runs without the Visual C++ Redistributable. cc/cmake pick this up too,
+# so whisper.cpp is compiled with /MT instead of /MD.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
