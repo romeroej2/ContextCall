@@ -4,7 +4,7 @@ All notable changes to ContextCall are documented here.
 
 Format: `## [version] - date`, newest first.
 
-## Unreleased
+## [1.3.0] - 2026-11-25
 
 ### Windows
 
