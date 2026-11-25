@@ -147,7 +147,7 @@ jobs:
 
   build-mac:
     needs: prepare-whisper
-    runs-on: macos-14
+    runs-on: macos-26
     defaults:
       run:
         working-directory: contextcall
