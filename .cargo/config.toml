@@ -1,0 +1,17 @@
+# Link the MSVC C/C++ runtime statically on Windows so ContextCall.exe (installed or
+# portable) runs without the Visual C++ Redistributable. cc/cmake pick this up too,
+# so whisper.cpp is compiled with /MT instead of /MD.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# whisper-rs-sys forwards CMAKE_* env vars to its whisper.cpp CMake build. In debug
+# builds it switches to RelWithDebInfo, whose default flags keep /MD (the cmake
+# crate only injects /MT for the cargo profile's config), so debug/test/coverage
+# links fail with unresolved __imp_* CRT symbols. Pin the runtime for every config.
+# Both settings are ignored by non-MSVC compilers, so they are harmless elsewhere.
+[env]
+CMAKE_POLICY_DEFAULT_CMP0091 = "NEW"
+CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"

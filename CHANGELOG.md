@@ -4,6 +4,19 @@ All notable changes to ContextCall are documented here.
 
 Format: `## [version] - date`, newest first.
 
+## Unreleased
+
+### Windows
+
+- **Portable EXE** - each release now includes
+  `ContextCall_<version>_x64-portable.exe`, which runs without installing. It
+  uses the same `%APPDATA%\ContextCall` data folder as the installed app and
+  downloads models on first use. Needs WebView2 (built into Windows 11 and
+  current Windows 10).
+- **No Visual C++ Redistributable needed** - the MSVC runtime is now linked
+  statically, so the installed app and the portable EXE start on a clean
+  Windows install. The release build fails if the EXE imports a non-system DLL.
+
 ## [1.2.0] - 2026-11-25
 
 ### Transcript & speakers

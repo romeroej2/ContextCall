@@ -42,8 +42,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm.cmd ci
 
-      - name: Build Windows installers
+      - name: Build Windows installers and app exe
         run: npm.cmd run tauri -- build --bundles nsis,msi
+
+      - name: Stage and check portable exe
+        run: pwsh ./scripts/stage-portable.ps1
 
       - name: Upload Windows bundle artifacts
         uses: actions/upload-artifact@v4
@@ -52,4 +55,5 @@ jobs:
           path: |
             target/release/bundle/nsis/*.exe
             target/release/bundle/msi/*.msi
+            target/release/bundle/portable/*.exe
           if-no-files-found: error

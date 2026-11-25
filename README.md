@@ -28,7 +28,7 @@ ContextCall transcribes both speakers in a call in real time. It grounds its sug
 - **Two-speaker transcription.** On Windows and macOS it captures your microphone and system audio as separate speakers, with echo cancellation so speaker sound does not bleed into your mic.
 - **Retrieval over your notes.** It indexes chosen Obsidian folders or a folder of Markdown and text files with embeddings, and shows the source note behind each suggestion.
 - **Interview practice.** Rehearse answers grounded in your own resume and the job description before the real conversation.
-- **Cross-platform releases.** The project's own GitHub Actions pipeline builds installers for Windows (EXE, MSI), macOS (DMG) and Linux (DEB) on every tagged release.
+- **Cross-platform releases.** The project's own GitHub Actions pipeline builds installers for Windows (EXE, MSI, plus a portable EXE), macOS (DMG) and Linux (DEB) on every tagged release.
 
 For first-time setup with LM Studio, start here: [LM Studio Setup Guide](docs/lm-studio-setup.md).
 
@@ -118,7 +118,7 @@ Grab the latest release for your platform from the [Releases page](https://githu
 
 On every tag push, GitHub Actions publishes installers for all supported desktop platforms:
 
-- Windows: EXE and MSI
+- Windows: EXE and MSI installers, plus a portable EXE (`ContextCall_<version>_x64-portable.exe`) that runs without installing
 - macOS: DMG
 - Linux: DEB
 
@@ -141,6 +141,22 @@ npm run tauri -- build
 ```
 
 The installers are output to `target/release/bundle/` at the repo root.
+
+#### Windows portable EXE
+
+The portable EXE is the app itself, no installer: the UI is compiled in and the
+Visual C++ runtime is linked statically, so it needs only Windows and the WebView2
+runtime (built into Windows 11 and current Windows 10). It keeps settings, sessions
+and models in `%APPDATA%\ContextCall`, the same place as the installed app, and
+downloads speech models on first use. After `npm run tauri -- build`, stage and
+check it with:
+
+```powershell
+pwsh contextcall/scripts/stage-portable.ps1
+```
+
+It writes `target/release/bundle/portable/ContextCall_<version>_x64-portable.exe`
+and fails if the exe imports any DLL that isn't part of Windows.
 
 #### macOS local installs (keep mic / screen permissions)
 
