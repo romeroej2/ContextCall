@@ -4,7 +4,19 @@ All notable changes to ContextCall are documented here.
 
 Format: `## [version] - date`, newest first.
 
-## Unreleased
+## [1.2.0] - 2026-11-25
+
+### Transcript & speakers
+
+- **Fewer phantom speakers** - saved sessions often showed 14-21 "Speaker N"
+  labels on calls with a handful of people. Diarization now embeds a speaker's
+  whole uninterrupted turn (up to 10 s) instead of each ~3 s chunk, clips under
+  2 s can only match a known speaker, and the FluidAudio engine re-clusters the
+  session as it goes and at stop, relabelling the live transcript and the saved
+  session. Accuracy on a noisy multi-voice benchmark rose from 65% to 85%.
+- **Sentence bubbles** - consecutive segments from the same speaker merge into
+  one bubble until an 8 s pause, a speaker change, or a long finished sentence,
+  in live capture and loaded sessions. Stored segments are unchanged.
 
 ### Interview / Consultant
 
@@ -18,6 +30,11 @@ Format: `## [version] - date`, newest first.
   `/Applications/ContextCall.app` with your Apple Development certificate so mic
   and screen-recording permissions survive rebuilds (ad-hoc signing reset them
   every update).
+
+### Docs
+
+- README intro rewritten around local-first privacy: local models first, and
+  interview mode described as practice.
 
 ## [1.1.1] - 2026-10-26
 
